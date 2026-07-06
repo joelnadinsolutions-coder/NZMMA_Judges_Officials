@@ -19,10 +19,10 @@ The one thing to *not* over-engineer: you do not need a separate backend service
 
 ## 2. System shape
 
-Two surfaces, one database:
+Two surfaces, one database — **both built and live in this repo**:
 
-- **Roundmaster (Judge PWA)** — mobile-first, installable, offline-first. Judges tap round scores. *This repo scaffolds this surface in full.*
-- **FightTrack (Officials/Admin dashboard)** — desktop web. Officials watch the master scorecard update live, control rounds (start/lock), and approve users. *Schema + realtime + RLS fully support it; the dashboard UI is the natural next build.*
+- **Roundmaster (Judge PWA)** — mobile-first, installable, offline-first. Judges tap round scores.
+- **FightTrack (Officials/Admin dashboard)** — mobile-first web (not desktop-only as originally scoped). Officials create events/bouts, assign judges, watch every judge's card update live, control rounds (open/lock), record point deductions, and close out bouts. A separate admin hub handles user approvals and role management.
 
 ```
 Judge phone (PWA)  ──tap──►  IndexedDB queue  ──flush──►  Supabase Postgres
@@ -56,8 +56,17 @@ Key design choices:
 - **`rounds` gives the official control.** A judge can only write while `rounds.state = 'live'`. Advancing/locking rounds is an official action; judges' cards follow via Realtime.
 - **`scores` is one row per `(judge_id, fight_id, round_number)`** with a unique constraint, so re-taps are idempotent upserts (critical for the offline queue). A `CHECK` enforces the 10-point-must (at least one fighter scores a 10) and the 6–10 range.
 - **Composite FK** ties every score to a real round of that fight.
+- **`fights.state`** (`scheduled` → `in_progress` → `completed`/`cancelled`) tracks the bout's lifecycle, separately from `rounds.state`. Opening round 1 flips `scheduled` → `in_progress`; the `complete_fight()` RPC closes the bout out.
 
-See `supabase/schema.sql` for the full DDL, RLS policies, triggers, and the `lock_round()` function.
+See `supabase/schema.sql` for the base DDL, RLS policies, triggers, and `lock_round()`. Three additive migrations layer on top (all idempotent, run once each in the SQL editor):
+
+| Migration | Adds |
+|---|---|
+| `supabase/phase2.sql` | Per-round point deductions (`fighter_a_deduction`/`_b`, `deduction_note`); bout format (`round_minutes`, `is_championship`). |
+| `supabase/phase2b_margin_tag.sql` | `scores.margin_tag` (`close`/`decisive`) — a judge's optional round-margin annotation. |
+| `supabase/phase3_fight_lifecycle.sql` | `fights.result_method`/`result_winner`/`result_round`/`result_note`/`completed_at`, a DB check that `state = 'completed'` requires a recorded method, and the `complete_fight()` RPC (official-only; bulk-locks every remaining round and stamps the result atomically). |
+
+`supabase/seed_test_panel.sql` is a manual dev fixture (adds two extra judges + scores to a named test bout) — not part of the deployed schema.
 
 ---
 
@@ -70,6 +79,7 @@ RLS is on for every table. Highlights:
 - **Officials/admins SELECT all scores** — this is what powers the instant master scorecard.
 - **No DELETE policy exists on `scores` or `score_audit`** — data is append-only by construction.
 - `lock_round(fight_id, round_number)` (official-only) atomically stamps the round `locked` and flips every card `is_locked = true`; after that the immutability trigger rejects edits.
+- `complete_fight(fight_id, method, winner, round, note)` (official-only) is the bout-closure counterpart: it locks *every remaining round* in one call (so a KO/TKO/Submission/DQ mid-round still seals off further scoring) and stamps `fights.state = 'completed'` with the result. A DB check constraint refuses `state = 'completed'` without a `result_method`, so the closure can't happen silently through a raw client update.
 
 ---
 
@@ -114,6 +124,15 @@ Steps:
 
 ## 9. Scope of this deliverable vs. next steps
 
-**Included & complete:** full DB schema + RLS + audit/immutability + round-lock; judge auth (magic-link); the offline-first scoring card; PWA config (manifest, SW, next.config, layout metadata).
+**Included & complete:**
+- Full DB schema + RLS + audit/immutability + round-lock, plus the phase 2/2b/3 migrations (deductions, format, margin tags, fight lifecycle + closure).
+- Judge auth (magic-link) and the offline-first scoring card, including live round-follow, per-round notes/margin tags, and a bout-complete/cancelled banner.
+- PWA config (manifest, SW, next.config, layout metadata).
+- **FightTrack officials dashboard** (`/admin`): user approvals (approve/suspend/change role), event & bout creation, judge assignment, and per-bout round control (`/official/[fightId]`) — open/lock rounds, point deductions with a reason note, live per-judge submission chips, a computed unanimous/majority/split/draw decision, and bout closure (decision/KO/TKO/submission/DQ/no-contest, with a confirmation step) via `complete_fight()`. Events can be toggled live/not-live from the admin list.
 
-**Natural next build (schema already supports it):** the FightTrack officials dashboard — master scorecard consolidating three judges live, round-control buttons calling `lock_round()`, the User Approvals screen, and Judge Performance/trend analytics (all readable under the official RLS policies). Say the word and I'll scaffold it.
+**Natural next build:** Judge Performance / trend analytics (consistency across a judge's history, deviation from panel consensus on split/majority decisions) — the schema already supports it under the official RLS policies, since every score is retained and attributed to a judge and a fight.
+
+**Known gaps:**
+- No automated tests.
+- `supabase/seed_test_panel.sql` is a manual, non-repeatable dev fixture — worth turning into a proper seed script if local/staging environments multiply.
+- Single squashed initial commit — no incremental git history yet to lean on for "why" questions.

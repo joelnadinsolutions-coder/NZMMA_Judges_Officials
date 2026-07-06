@@ -1,7 +1,7 @@
 import Link from 'next/link';
 
-// Minimal landing page. Judges sign in from here; officials get their own
-// dashboard in a later build (see BLUEPRINT.md, section 9).
+// Minimal landing page. Judges sign in from here; officials reach their
+// dashboard (/admin) via a link shown after sign-in on the login page.
 export default function HomePage() {
   return (
     <main className="grid min-h-dvh place-items-center bg-slate-950 px-6 text-center">

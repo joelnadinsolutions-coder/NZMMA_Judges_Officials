@@ -10,7 +10,9 @@ interface EventRow {
   name: string;
   event_date: string;
   region: string | null;
+  is_live: boolean;
 }
+type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 interface FightRow {
   id: string;
   event_id: string;
@@ -19,6 +21,10 @@ interface FightRow {
   fighter_a_name: string;
   fighter_b_name: string;
   scheduled_rounds: number;
+  state: FightState;
+  result_method: string | null;
+  result_winner: 'a' | 'b' | 'draw' | null;
+  result_round: number | null;
 }
 interface JudgeRow {
   id: string;
@@ -37,10 +43,15 @@ export default function EventsPage() {
 
   const load = useCallback(async () => {
     const [{ data: ev }, { data: fi }, { data: pr }, { data: fj }] = await Promise.all([
-      supabase.from('events').select('id, name, event_date, region').order('event_date', { ascending: false }),
+      supabase
+        .from('events')
+        .select('id, name, event_date, region, is_live')
+        .order('event_date', { ascending: false }),
       supabase
         .from('fights')
-        .select('id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds')
+        .select(
+          'id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, result_method, result_winner, result_round',
+        )
         .order('bout_order'),
       supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
       supabase.from('fight_judges').select('fight_id, judge_id'),
@@ -109,6 +120,14 @@ export default function EventsPage() {
     setBusy(false);
   }
 
+  async function toggleLive(eventId: string, isLive: boolean) {
+    if (busy) return;
+    setBusy(true);
+    await supabase.from('events').update({ is_live: !isLive }).eq('id', eventId);
+    await load();
+    setBusy(false);
+  }
+
   async function toggleAssign(fightId: string, judgeId: string, assigned: boolean) {
     if (busy) return;
     setBusy(true);
@@ -139,12 +158,23 @@ export default function EventsPage() {
 
       {events.map((ev) => (
         <section key={ev.id} className="space-y-3 rounded-2xl bg-slate-900 p-4">
-          <div>
-            <h2 className="text-lg font-black">{ev.name}</h2>
-            <p className="text-xs text-slate-400">
-              {ev.event_date}
-              {ev.region ? ` · ${ev.region}` : ''}
-            </p>
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <h2 className="text-lg font-black">{ev.name}</h2>
+              <p className="text-xs text-slate-400">
+                {ev.event_date}
+                {ev.region ? ` · ${ev.region}` : ''}
+              </p>
+            </div>
+            <button
+              onClick={() => toggleLive(ev.id, ev.is_live)}
+              disabled={busy}
+              className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold uppercase tracking-widest disabled:opacity-40 ${
+                ev.is_live ? 'bg-emerald-500 text-white' : 'bg-slate-800 text-slate-400'
+              }`}
+            >
+              {ev.is_live ? '● Live' : 'Go live'}
+            </button>
           </div>
 
           {fights
@@ -249,17 +279,43 @@ function FightCard({
   onToggle: (fightId: string, judgeId: string, assigned: boolean) => void;
 }) {
   const [showJudges, setShowJudges] = useState(false);
+  const stateCls =
+    fight.state === 'in_progress'
+      ? 'bg-emerald-500/15 text-emerald-300'
+      : fight.state === 'completed'
+      ? 'bg-slate-700 text-slate-300'
+      : fight.state === 'cancelled'
+      ? 'bg-red-500/15 text-red-300'
+      : 'bg-slate-800 text-slate-500';
+  const resultSummary =
+    fight.state === 'completed' && fight.result_method
+      ? fight.result_method === 'no_contest'
+        ? 'No Contest'
+        : `${
+            fight.result_winner === 'a'
+              ? fight.fighter_a_name.split(' ')[0]
+              : fight.result_winner === 'b'
+              ? fight.fighter_b_name.split(' ')[0]
+              : 'Draw'
+          } · ${fight.result_method.toUpperCase()}${fight.result_round ? ` R${fight.result_round}` : ''}`
+      : null;
   return (
     <div className="rounded-xl bg-slate-950/60 p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
-          <p className="truncate font-bold">
-            {fight.fighter_a_name} <span className="text-slate-500">vs</span> {fight.fighter_b_name}
-          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <p className="truncate font-bold">
+              {fight.fighter_a_name} <span className="text-slate-500">vs</span> {fight.fighter_b_name}
+            </p>
+            <span className={`shrink-0 rounded-full px-2 py-0.5 text-[9px] font-bold uppercase tracking-widest ${stateCls}`}>
+              {fight.state.replace('_', ' ')}
+            </span>
+          </div>
           <p className="text-xs text-slate-400">
             Bout {fight.bout_order} · {fight.weight_class} · {fight.scheduled_rounds} rounds ·{' '}
             {assigned.length} judge{assigned.length === 1 ? '' : 's'}
           </p>
+          {resultSummary && <p className="text-xs font-semibold text-emerald-300">{resultSummary}</p>}
         </div>
         <Link
           href={`/official/${fight.id}`}

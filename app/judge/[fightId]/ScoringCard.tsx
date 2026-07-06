@@ -15,6 +15,7 @@ interface Fight {
   current_round: number;
   round_minutes?: number;
   is_championship?: boolean;
+  state?: 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 }
 
 type SubmitState = 'idle' | 'submitting' | 'saved' | 'pending' | 'error';
@@ -290,8 +291,20 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         )}
       </div>
 
+      {/* ---- Bout-complete banner ---- */}
+      {fight.state === 'completed' && (
+        <p className="mx-4 mb-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-center text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">
+          Bout complete. The official has recorded the result.
+        </p>
+      )}
+      {fight.state === 'cancelled' && (
+        <p className="mx-4 mb-2 rounded-lg bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
+          This bout was cancelled.
+        </p>
+      )}
+
       {/* ---- Round status banner ---- */}
-      {!roundLive && (
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && (
         <p className="mx-4 mb-2 rounded-lg bg-slate-800/60 px-3 py-2 text-center text-xs font-semibold text-slate-300">
           {roundLocked
             ? 'Round locked. Scores are final.'

@@ -3,6 +3,10 @@
 import { use, useCallback, useEffect, useState } from 'react';
 import { getSupabase } from '@/lib/supabase/client';
 
+type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
+type ResultMethod = 'decision' | 'ko' | 'tko' | 'submission' | 'dq' | 'no_contest';
+type ResultWinner = 'a' | 'b' | 'draw';
+
 interface Fight {
   id: string;
   fighter_a_name: string;
@@ -14,6 +18,11 @@ interface Fight {
   current_round: number;
   round_minutes: number;
   is_championship: boolean;
+  state: FightState;
+  result_method: ResultMethod | null;
+  result_winner: ResultWinner | null;
+  result_round: number | null;
+  result_note: string | null;
 }
 
 type RoundState = 'pending' | 'live' | 'locked';
@@ -80,6 +89,27 @@ function decisionLabel(results: JudgeResult[], shortA: string, shortB: string): 
   return 'Draw (split)';
 }
 
+// Same majority logic as decisionLabel, but as a plain a/b/draw value for
+// prefilling the official's "close bout" winner picker.
+function majorityWinner(results: JudgeResult[]): ResultWinner {
+  const n = results.length;
+  const a = results.filter((r) => r === 'a').length;
+  const b = results.filter((r) => r === 'b').length;
+  const majority = (n + 1) / 2;
+  if (a > b && a >= majority) return 'a';
+  if (b > a && b >= majority) return 'b';
+  return 'draw';
+}
+
+const RESULT_METHOD_LABEL: Record<ResultMethod, string> = {
+  decision: 'Decision',
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  no_contest: 'No Contest',
+};
+
 export default function OfficialFightPage({ params }: { params: Promise<{ fightId: string }> }) {
   const { fightId } = use(params);
   const supabase = getSupabase();
@@ -95,7 +125,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const { data: f, error: fErr } = await supabase
       .from('fights')
       .select(
-        'id, fighter_a_name, fighter_b_name, fighter_a_corner, fighter_b_corner, weight_class, scheduled_rounds, current_round, round_minutes, is_championship',
+        'id, fighter_a_name, fighter_b_name, fighter_a_corner, fighter_b_corner, weight_class, scheduled_rounds, current_round, round_minutes, is_championship, state, result_method, result_winner, result_round, result_note',
       )
       .eq('id', fightId)
       .single();
@@ -168,7 +198,36 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     setBusy(true);
     // Open this round and make it the current round the judges follow.
     await supabase.from('rounds').update({ state: 'live', started_at: new Date().toISOString() }).eq('fight_id', fightId).eq('round_number', n);
-    await supabase.from('fights').update({ current_round: n }).eq('id', fightId);
+    // First round opened moves the bout out of "scheduled".
+    const patch: Partial<Fight> = { current_round: n };
+    if (fight?.state === 'scheduled') patch.state = 'in_progress';
+    await supabase.from('fights').update(patch).eq('id', fightId);
+    await load();
+    setBusy(false);
+  }
+
+  async function closeBout(method: ResultMethod, winner: ResultWinner | null, atRound: number | null, note: string) {
+    if (busy) return;
+    setBusy(true);
+    const { error: rpcErr } = await supabase.rpc('complete_fight', {
+      f_id: fightId,
+      method,
+      winner,
+      at_round: atRound,
+      note: note || null,
+    });
+    if (rpcErr) setError(rpcErr.message);
+    await load();
+    setBusy(false);
+  }
+
+  async function cancelBout(note: string) {
+    if (busy) return;
+    setBusy(true);
+    await supabase
+      .from('fights')
+      .update({ state: 'cancelled', result_note: note || null })
+      .eq('id', fightId);
     await load();
     setBusy(false);
   }
@@ -249,17 +308,41 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const decisionNotes: string[] = [];
   if (judges.length < 3) decisionNotes.push(`${judges.length} of 3 judges`);
   if (!allLocked) decisionNotes.push('provisional, not all rounds locked');
+  const suggestedWinner = majorityWinner(results);
 
   return (
     <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
       <header>
-        <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-          NZMMAF · Official control
-        </p>
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+            NZMMAF · Official control
+          </p>
+          <FightStateBadge state={fight.state} />
+        </div>
         <h1 className="mt-1 text-2xl font-black">
           {fight.fighter_a_name} <span className="text-slate-500">vs</span> {fight.fighter_b_name}
         </h1>
       </header>
+
+      {fight.state === 'completed' && (
+        <section className="rounded-2xl bg-emerald-500/10 p-4 text-center ring-1 ring-emerald-500/30">
+          <p className="text-lg font-black text-emerald-300">
+            {fight.result_method === 'no_contest'
+              ? 'No Contest'
+              : `${fight.result_winner === 'a' ? shortA : fight.result_winner === 'b' ? shortB : 'Draw'} — ${
+                  RESULT_METHOD_LABEL[fight.result_method as ResultMethod]
+                }${fight.result_round ? ` (R${fight.result_round})` : ''}`}
+          </p>
+          {fight.result_note && <p className="mt-1 text-sm text-emerald-200/80">{fight.result_note}</p>}
+        </section>
+      )}
+
+      {fight.state === 'cancelled' && (
+        <section className="rounded-2xl bg-red-500/10 p-4 text-center ring-1 ring-red-500/30">
+          <p className="text-lg font-black text-red-300">Bout cancelled</p>
+          {fight.result_note && <p className="mt-1 text-sm text-red-200/80">{fight.result_note}</p>}
+        </section>
+      )}
 
       {judges.length > 0 && (
         <section className="rounded-2xl bg-slate-900 p-3">
@@ -339,10 +422,210 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         })}
       </section>
 
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <CloseBout
+          shortA={shortA}
+          shortB={shortB}
+          scheduledRounds={fight.scheduled_rounds}
+          suggestedWinner={suggestedWinner}
+          busy={busy}
+          onClose={closeBout}
+          onCancel={cancelBout}
+        />
+      )}
+
       <p className="pt-2 text-center text-xs text-slate-500">
         Judges follow the round you open here in real time.
       </p>
     </div>
+  );
+}
+
+function FightStateBadge({ state }: { state: FightState }) {
+  const cls =
+    state === 'in_progress'
+      ? 'bg-emerald-500/15 text-emerald-300'
+      : state === 'completed'
+      ? 'bg-slate-700 text-slate-200'
+      : state === 'cancelled'
+      ? 'bg-red-500/15 text-red-300'
+      : 'bg-slate-800 text-slate-400';
+  return (
+    <span className={`rounded-full px-3 py-1 text-[10px] font-bold uppercase tracking-widest ${cls}`}>
+      {state.replace('_', ' ')}
+    </span>
+  );
+}
+
+function CloseBout({
+  shortA,
+  shortB,
+  scheduledRounds,
+  suggestedWinner,
+  busy,
+  onClose,
+  onCancel,
+}: {
+  shortA: string;
+  shortB: string;
+  scheduledRounds: number;
+  suggestedWinner: ResultWinner;
+  busy: boolean;
+  onClose: (method: ResultMethod, winner: ResultWinner | null, atRound: number | null, note: string) => void;
+  onCancel: (note: string) => void;
+}) {
+  const [method, setMethod] = useState<ResultMethod>('decision');
+  const [winner, setWinner] = useState<ResultWinner>(suggestedWinner);
+  const [atRound, setAtRound] = useState(scheduledRounds);
+  const [note, setNote] = useState('');
+  const [confirming, setConfirming] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelNote, setCancelNote] = useState('');
+
+  const isFinish = method !== 'decision' && method !== 'no_contest';
+  const needsWinner = method !== 'no_contest';
+
+  return (
+    <section className="space-y-3 rounded-2xl bg-slate-900 p-4">
+      <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Close bout</h2>
+
+      <div className="grid grid-cols-3 gap-1.5">
+        {(Object.keys(RESULT_METHOD_LABEL) as ResultMethod[]).map((m) => (
+          <button
+            key={m}
+            onClick={() => setMethod(m)}
+            className={`h-10 rounded-lg text-xs font-bold uppercase transition ${
+              method === m ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
+            }`}
+          >
+            {RESULT_METHOD_LABEL[m]}
+          </button>
+        ))}
+      </div>
+
+      {needsWinner && (
+        <div>
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Winner</p>
+          <div className="flex gap-1.5">
+            {(
+              [
+                ['a', shortA],
+                ['b', shortB],
+                ['draw', 'Draw'],
+              ] as [ResultWinner, string][]
+            ).map(([w, label]) => (
+              <button
+                key={w}
+                onClick={() => setWinner(w)}
+                className={`h-10 flex-1 rounded-lg text-sm font-bold transition ${
+                  winner === w ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isFinish && (
+        <div>
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Round</p>
+          <div className="flex gap-1.5">
+            {Array.from({ length: scheduledRounds }, (_, i) => i + 1).map((r) => (
+              <button
+                key={r}
+                onClick={() => setAtRound(r)}
+                className={`h-10 flex-1 rounded-lg text-sm font-bold transition ${
+                  atRound === r ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
+                }`}
+              >
+                R{r}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <input
+        value={note}
+        onChange={(e) => setNote(e.target.value)}
+        placeholder="Note (optional)"
+        className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
+      />
+
+      {confirming ? (
+        <div className="space-y-2 rounded-xl bg-slate-950/60 p-3">
+          <p className="text-center text-sm text-slate-300">
+            Confirm: {method === 'no_contest' ? 'No Contest' : `${winner === 'a' ? shortA : winner === 'b' ? shortB : 'Draw'} by ${RESULT_METHOD_LABEL[method]}`}
+            {isFinish ? ` (R${atRound})` : ''}? This locks every round — it cannot be undone.
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                onClose(method, needsWinner ? winner : null, isFinish ? atRound : null, note);
+                setConfirming(false);
+              }}
+              disabled={busy}
+              className="h-11 flex-1 rounded-xl bg-emerald-500 text-sm font-bold text-white disabled:opacity-40"
+            >
+              Confirm close
+            </button>
+            <button
+              onClick={() => setConfirming(false)}
+              className="h-11 rounded-xl bg-slate-800 px-4 text-sm font-bold text-slate-300"
+            >
+              Back
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setConfirming(true)}
+          disabled={busy}
+          className="h-12 w-full rounded-xl bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
+        >
+          Close bout
+        </button>
+      )}
+
+      {cancelling ? (
+        <div className="space-y-2 rounded-xl bg-red-950/30 p-3 ring-1 ring-red-500/20">
+          <input
+            value={cancelNote}
+            onChange={(e) => setCancelNote(e.target.value)}
+            placeholder="Reason (e.g. weigh-in failure, injury)"
+            className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                onCancel(cancelNote);
+                setCancelling(false);
+              }}
+              disabled={busy}
+              className="h-10 flex-1 rounded-lg bg-red-600/80 text-sm font-bold text-white disabled:opacity-40"
+            >
+              Confirm cancel
+            </button>
+            <button
+              onClick={() => setCancelling(false)}
+              className="h-10 rounded-lg bg-slate-800 px-4 text-sm font-bold text-slate-300"
+            >
+              Back
+            </button>
+          </div>
+        </div>
+      ) : (
+        <button
+          onClick={() => setCancelling(true)}
+          disabled={busy}
+          className="text-xs font-semibold text-slate-500 underline decoration-dotted"
+        >
+          Cancel this bout instead
+        </button>
+      )}
+    </section>
   );
 }
 
