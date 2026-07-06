@@ -1,0 +1,33 @@
+{
+  "name": "nzmmaf-roundmaster",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cross-env NODE_OPTIONS=--require=./scripts/patch-node24-readlink.cjs next dev",
+    "build": "cross-env NODE_OPTIONS=--require=./scripts/patch-node24-readlink.cjs next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "idb": "^8.0.0",
+    "next": "^15.1.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@serwist/next": "^9.0.0",
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "cross-env": "^10.1.0",
+    "serwist": "^9.0.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.0",
+    "webpack": "5.97.1"
+  },
+  "overrides": {
+    "webpack": {
+      "enhanced-resolve": "5.17.1"
+    }
+  }
+}
