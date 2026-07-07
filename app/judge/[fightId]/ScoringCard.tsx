@@ -299,14 +299,30 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
 
       {/* ---- Bout-complete banner ---- */}
       {fight.state === 'completed' && (
-        <p className="mx-4 mb-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-center text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">
-          Bout complete. The official has recorded the result.
-        </p>
+        <div className="mx-4 mb-2 space-y-2">
+          <p className="rounded-lg bg-emerald-500/10 px-3 py-2 text-center text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">
+            Bout complete. The official has recorded the result.
+          </p>
+          <Link
+            href="/login"
+            className="block h-12 rounded-xl bg-slate-50 text-center text-sm font-bold leading-[3rem] text-slate-950"
+          >
+            Back to your bouts
+          </Link>
+        </div>
       )}
       {fight.state === 'cancelled' && (
-        <p className="mx-4 mb-2 rounded-lg bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
-          This bout was cancelled.
-        </p>
+        <div className="mx-4 mb-2 space-y-2">
+          <p className="rounded-lg bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
+            This bout was cancelled.
+          </p>
+          <Link
+            href="/login"
+            className="block h-12 rounded-xl bg-slate-50 text-center text-sm font-bold leading-[3rem] text-slate-950"
+          >
+            Back to your bouts
+          </Link>
+        </div>
       )}
 
       {/* ---- Round status banner ---- */}
