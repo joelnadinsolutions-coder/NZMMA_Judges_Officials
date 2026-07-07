@@ -6,6 +6,13 @@ import { getSupabase } from '@/lib/supabase/client';
 
 type Mode = 'signin' | 'signup' | 'magic';
 type ProfileStatus = 'pending' | 'approved' | 'suspended';
+interface AssignedBout {
+  id: string;
+  fighter_a_name: string;
+  fighter_b_name: string;
+  weight_class: string;
+  state: string;
+}
 
 export default function LoginPage() {
   const supabase = getSupabase();
@@ -18,6 +25,7 @@ export default function LoginPage() {
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
   const [signedInUserId, setSignedInUserId] = useState<string | null>(null);
   const [profileStatus, setProfileStatus] = useState<ProfileStatus | null>(null);
+  const [bouts, setBouts] = useState<AssignedBout[]>([]);
 
   // When a magic link redirects back here, the client picks up the session
   // from the URL (detectSessionInUrl). Reflect that so it does not look like a
@@ -59,6 +67,35 @@ export default function LoginPage() {
       cancelled = true;
     };
   }, [supabase, signedInUserId]);
+
+  // Approved judges see their assigned bouts right here, no link-passing
+  // needed. RLS already scopes both queries to the signed-in judge.
+  useEffect(() => {
+    if (!signedInUserId || profileStatus !== 'approved') {
+      setBouts([]);
+      return;
+    }
+    let cancelled = false;
+    supabase
+      .from('fight_judges')
+      .select('fights(id, fighter_a_name, fighter_b_name, weight_class, state)')
+      .eq('judge_id', signedInUserId)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error) {
+          setBouts([]);
+          return;
+        }
+        const rows = (data ?? [])
+          .map((r) => r.fights as unknown as AssignedBout | null)
+          .filter((f): f is AssignedBout => Boolean(f))
+          .filter((f) => f.state === 'scheduled' || f.state === 'in_progress');
+        setBouts(rows);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, signedInUserId, profileStatus]);
 
   function resetMessages() {
     setErr(null);
@@ -153,9 +190,41 @@ export default function LoginPage() {
             )}
             {(profileStatus === 'approved' || profileStatus === null) && (
               <>
-                <p className="text-sm text-slate-400">
-                  Open the bout link an official gives you to start scoring.
-                </p>
+                {bouts.length > 0 ? (
+                  <div className="space-y-2 text-left">
+                    <p className="text-xs font-bold uppercase tracking-widest text-slate-500">
+                      Your assigned bouts
+                    </p>
+                    {bouts.map((b) => (
+                      <Link
+                        key={b.id}
+                        href={`/judge/${b.id}`}
+                        className="flex items-center justify-between gap-2 rounded-xl bg-slate-900 p-4 ring-1 ring-slate-700"
+                      >
+                        <span className="min-w-0">
+                          <span className="block truncate font-bold text-slate-50">
+                            {b.fighter_a_name} vs {b.fighter_b_name}
+                          </span>
+                          <span className="block text-xs text-slate-400">{b.weight_class}</span>
+                        </span>
+                        <span
+                          className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${
+                            b.state === 'in_progress'
+                              ? 'bg-emerald-500/15 text-emerald-300'
+                              : 'bg-slate-800 text-slate-400'
+                          }`}
+                        >
+                          {b.state === 'in_progress' ? 'Live' : 'Upcoming'}
+                        </span>
+                      </Link>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="text-sm text-slate-400">
+                    No bouts assigned to you yet. An official assigns you to a
+                    bout, then it appears here.
+                  </p>
+                )}
                 <Link
                   href="/admin"
                   className="block h-12 rounded-xl bg-slate-50 text-sm font-bold leading-[3rem] text-slate-950"
