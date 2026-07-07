@@ -26,6 +26,8 @@ export default function LoginPage() {
   const [signedInUserId, setSignedInUserId] = useState<string | null>(null);
   const [profileStatus, setProfileStatus] = useState<ProfileStatus | null>(null);
   const [bouts, setBouts] = useState<AssignedBout[]>([]);
+  const [pastBouts, setPastBouts] = useState<AssignedBout[]>([]);
+  const [showPast, setShowPast] = useState(false);
 
   // When a magic link redirects back here, the client picks up the session
   // from the URL (detectSessionInUrl). Reflect that so it does not look like a
@@ -73,6 +75,7 @@ export default function LoginPage() {
   useEffect(() => {
     if (!signedInUserId || profileStatus !== 'approved') {
       setBouts([]);
+      setPastBouts([]);
       return;
     }
     let cancelled = false;
@@ -84,13 +87,16 @@ export default function LoginPage() {
         if (cancelled) return;
         if (error) {
           setBouts([]);
+          setPastBouts([]);
           return;
         }
         const rows = (data ?? [])
           .map((r) => r.fights as unknown as AssignedBout | null)
-          .filter((f): f is AssignedBout => Boolean(f))
-          .filter((f) => f.state === 'scheduled' || f.state === 'in_progress');
-        setBouts(rows);
+          .filter((f): f is AssignedBout => Boolean(f));
+        setBouts(rows.filter((f) => f.state === 'scheduled' || f.state === 'in_progress'));
+        // Finished bouts fold away but stay readable: a judge can always
+        // open their own locked scorecard.
+        setPastBouts(rows.filter((f) => f.state === 'completed' || f.state === 'cancelled'));
       });
     return () => {
       cancelled = true;
@@ -224,6 +230,40 @@ export default function LoginPage() {
                     No bouts assigned to you yet. An official assigns you to a
                     bout, then it appears here.
                   </p>
+                )}
+                {pastBouts.length > 0 && (
+                  <div className="space-y-2 text-left">
+                    <button
+                      onClick={() => setShowPast((s) => !s)}
+                      className="text-xs font-semibold text-slate-500"
+                    >
+                      {showPast ? '▾' : '▸'} Past bouts ({pastBouts.length})
+                    </button>
+                    {showPast &&
+                      pastBouts.map((b) => (
+                        <Link
+                          key={b.id}
+                          href={`/judge/${b.id}`}
+                          className="flex items-center justify-between gap-2 rounded-xl bg-slate-900/60 p-4 ring-1 ring-slate-800"
+                        >
+                          <span className="min-w-0">
+                            <span className="block truncate font-bold text-slate-300">
+                              {b.fighter_a_name} vs {b.fighter_b_name}
+                            </span>
+                            <span className="block text-xs text-slate-500">{b.weight_class}</span>
+                          </span>
+                          <span
+                            className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-bold uppercase tracking-widest ${
+                              b.state === 'completed'
+                                ? 'bg-slate-800 text-slate-400'
+                                : 'bg-red-500/15 text-red-300'
+                            }`}
+                          >
+                            {b.state === 'completed' ? 'Done' : 'Cancelled'}
+                          </span>
+                        </Link>
+                      ))}
+                  </div>
                 )}
                 <Link
                   href="/admin"
