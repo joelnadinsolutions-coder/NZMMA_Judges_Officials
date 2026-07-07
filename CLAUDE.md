@@ -40,7 +40,8 @@ changes.
 
 Schema and policies live in `supabase/` and are applied by hand in the
 Supabase SQL editor: `schema.sql` first, then the idempotent migrations
-`phase2.sql`, `phase2b_margin_tag.sql`, `phase3_fight_lifecycle.sql`.
+`phase2.sql`, `phase2b_margin_tag.sql`, `phase3_fight_lifecycle.sql`,
+`phase4_event_archive.sql`, `phase5_judge_finish_flags.sql`.
 `seed_test_panel.sql` is a manual dev fixture only.
 
 Rules that must not be weakened:
