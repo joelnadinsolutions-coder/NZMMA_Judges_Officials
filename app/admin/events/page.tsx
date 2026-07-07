@@ -44,31 +44,66 @@ export default function EventsPage() {
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState('');
   const [showArchived, setShowArchived] = useState(false);
+  const [loadedArchived, setLoadedArchived] = useState<Set<string>>(new Set());
 
-  const load = useCallback(async () => {
-    const [{ data: ev }, { data: fi }, { data: pr }, { data: fj }] = await Promise.all([
-      supabase
-        .from('events')
-        .select('id, name, event_date, region, is_live, archived_at')
-        .order('event_date', { ascending: false }),
-      supabase
-        .from('fights')
-        .select(
-          'id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, result_method, result_winner, result_round',
-        )
-        .order('bout_order'),
-      supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
-      supabase.from('fight_judges').select('fight_id, judge_id'),
-    ]);
-    setEvents((ev ?? []) as EventRow[]);
-    setFights((fi ?? []) as FightRow[]);
-    setJudges((pr ?? []).map((p) => ({ id: p.id, name: p.full_name })));
-    const map: Record<string, string[]> = {};
-    (fj ?? []).forEach((row) => {
-      (map[row.fight_id] ??= []).push(row.judge_id);
+  const FIGHT_COLS =
+    'id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, result_method, result_winner, result_round, fight_judges(judge_id)';
+
+  type FightWithJudges = FightRow & { fight_judges?: { judge_id: string }[] };
+  const applyFightRows = useCallback((rows: FightWithJudges[]) => {
+    setFights((prev) => {
+      const touchedEvents = new Set(rows.map((r) => r.event_id));
+      const kept = prev.filter((f) => !touchedEvents.has(f.event_id));
+      return [...kept, ...rows.map(({ fight_judges, ...f }) => f)];
     });
-    setAssignments(map);
-  }, [supabase]);
+    setAssignments((prev) => {
+      const next = { ...prev };
+      rows.forEach((r) => {
+        next[r.id] = (r.fight_judges ?? []).map((fj) => fj.judge_id);
+      });
+      return next;
+    });
+  }, []);
+
+  // Only active (non-archived) events load their bouts up front; archived
+  // events (which accumulate without bound over seasons) load lazily when
+  // expanded, so the list stays cheap no matter how much history piles up.
+  const load = useCallback(async () => {
+    const { data: ev } = await supabase
+      .from('events')
+      .select('id, name, event_date, region, is_live, archived_at')
+      .order('event_date', { ascending: false });
+    const evs = (ev ?? []) as EventRow[];
+    setEvents(evs);
+    const activeIds = evs.filter((e) => !e.archived_at).map((e) => e.id);
+    const [{ data: fi }, { data: pr }] = await Promise.all([
+      activeIds.length
+        ? supabase.from('fights').select(FIGHT_COLS).in('event_id', activeIds).order('bout_order')
+        : Promise.resolve({ data: [] as FightWithJudges[] }),
+      supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
+    ]);
+    setJudges((pr ?? []).map((p) => ({ id: p.id, name: p.full_name })));
+    setFights([]);
+    setAssignments({});
+    setLoadedArchived(new Set());
+    applyFightRows((fi ?? []) as FightWithJudges[]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, applyFightRows]);
+
+  const loadEventBouts = useCallback(
+    async (eventId: string) => {
+      if (loadedArchived.has(eventId)) return;
+      setLoadedArchived((prev) => new Set(prev).add(eventId));
+      const { data } = await supabase
+        .from('fights')
+        .select(FIGHT_COLS)
+        .eq('event_id', eventId)
+        .order('bout_order');
+      applyFightRows((data ?? []) as FightWithJudges[]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    [supabase, loadedArchived, applyFightRows],
+  );
 
   useEffect(() => {
     (async () => {
@@ -168,8 +203,10 @@ export default function EventsPage() {
       event={ev}
       defaultOpen={defaultOpen}
       boutCount={eventFights(ev.id).length}
+      countKnown={!ev.archived_at || loadedArchived.has(ev.id)}
       canArchive={canArchive(ev.id)}
       busy={busy}
+      onExpand={ev.archived_at ? () => loadEventBouts(ev.id) : undefined}
       onToggleLive={() => toggleLive(ev.id, ev.is_live)}
       onArchive={() => setArchived(ev.id, !ev.archived_at)}
     >
@@ -236,8 +273,10 @@ function EventSection({
   event,
   defaultOpen,
   boutCount,
+  countKnown,
   canArchive,
   busy,
+  onExpand,
   onToggleLive,
   onArchive,
   children,
@@ -245,8 +284,10 @@ function EventSection({
   event: EventRow;
   defaultOpen: boolean;
   boutCount: number;
+  countKnown: boolean;
   canArchive: boolean;
   busy: boolean;
+  onExpand?: () => void;
   onToggleLive: () => void;
   onArchive: () => void;
   children: React.ReactNode;
@@ -254,22 +295,31 @@ function EventSection({
   const [open, setOpen] = useState(defaultOpen);
   const isArchived = Boolean(event.archived_at);
 
+  // Lazy-load an archived event's bouts the first time it is opened.
+  function toggleOpen() {
+    setOpen((o) => {
+      const next = !o;
+      if (next) onExpand?.();
+      return next;
+    });
+  }
+
   return (
     <section className="space-y-3 rounded-2xl bg-slate-900 p-4">
       <div className="flex items-center gap-2">
         <button
-          onClick={() => setOpen((o) => !o)}
+          onClick={toggleOpen}
           className="shrink-0 px-1 text-lg text-slate-400"
           aria-label={open ? `Collapse ${event.name}` : `Expand ${event.name}`}
         >
           {open ? '▾' : '▸'}
         </button>
-        <button onClick={() => setOpen((o) => !o)} className="min-w-0 flex-1 text-left">
+        <button onClick={toggleOpen} className="min-w-0 flex-1 text-left">
           <h2 className="truncate text-lg font-black">{event.name}</h2>
           <p className="text-xs text-slate-400">
             {event.event_date}
-            {event.region ? ` · ${event.region}` : ''} · {boutCount} bout
-            {boutCount === 1 ? '' : 's'}
+            {event.region ? ` · ${event.region}` : ''}
+            {countKnown ? ` · ${boutCount} bout${boutCount === 1 ? '' : 's'}` : ''}
           </p>
         </button>
         {isArchived ? (
