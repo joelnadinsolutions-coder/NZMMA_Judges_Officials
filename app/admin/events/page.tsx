@@ -279,6 +279,18 @@ function FightCard({
   onToggle: (fightId: string, judgeId: string, assigned: boolean) => void;
 }) {
   const [showJudges, setShowJudges] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyJudgeLink() {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/judge/${fight.id}`);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard unavailable (old browser, insecure context): do nothing.
+    }
+  }
+
   const stateCls =
     fight.state === 'in_progress'
       ? 'bg-emerald-500/15 text-emerald-300'
@@ -325,12 +337,20 @@ function FightCard({
         </Link>
       </div>
 
-      <button
-        onClick={() => setShowJudges((s) => !s)}
-        className="mt-2 text-xs font-semibold text-slate-400"
-      >
-        {showJudges ? 'Hide judges' : 'Assign judges'}
-      </button>
+      <div className="mt-2 flex items-center gap-4">
+        <button
+          onClick={() => setShowJudges((s) => !s)}
+          className="text-xs font-semibold text-slate-400"
+        >
+          {showJudges ? 'Hide judges' : 'Assign judges'}
+        </button>
+        <button
+          onClick={copyJudgeLink}
+          className={`text-xs font-semibold ${copied ? 'text-emerald-300' : 'text-slate-400'}`}
+        >
+          {copied ? 'Link copied ✓' : 'Copy judge link'}
+        </button>
+      </div>
 
       {showJudges && (
         <div className="mt-2 space-y-1">
