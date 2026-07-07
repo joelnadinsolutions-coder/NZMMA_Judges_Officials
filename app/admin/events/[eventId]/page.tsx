@@ -1,9 +1,10 @@
 'use client';
 
-import { use, useCallback, useEffect, useState } from 'react';
+import { use, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { isApprovedOfficial, Loading, NotAuthorized } from '@/components/officials';
+import { CreateFight, type NewBout } from '@/components/bouts';
 
 interface EventRow {
   id: string;
@@ -27,8 +28,9 @@ interface JudgeRow {
   name: string;
 }
 
-// Event run sheet: every bout with its full judge panel in one view, plus
-// bout reordering and quick judge swaps for conflicts at a live event.
+// Event run sheet: every bout with its full judge panel in one view, drag
+// reordering of the running order, adding bouts, and quick judge swaps for
+// conflicts at a live event.
 export default function EventDetailPage({ params }: { params: Promise<{ eventId: string }> }) {
   const { eventId } = use(params);
   const supabase = getSupabase();
@@ -38,6 +40,7 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
   const [judges, setJudges] = useState<JudgeRow[]>([]);
   const [assignments, setAssignments] = useState<Record<string, string[]>>({});
   const [busy, setBusy] = useState(false);
+  const [reordering, setReordering] = useState(false);
   const [notFound, setNotFound] = useState(false);
 
   const load = useCallback(async () => {
@@ -77,32 +80,38 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
     })();
   }, [supabase, load]);
 
-  // Swap this bout with its neighbour. bout_order has a unique constraint
-  // per event, so the swap goes through a temporary out-of-range value.
-  async function moveBout(index: number, dir: -1 | 1) {
+  // Persist a dragged order as bout numbers 1..n. bout_order is unique per
+  // event, so pass one goes through temporary out-of-range values.
+  async function saveOrder(ids: string[]) {
     if (busy) return;
-    const a = fights[index];
-    const b = fights[index + dir];
-    if (!a || !b) return;
     setBusy(true);
-    const temp = 10000 + a.bout_order;
-    await supabase.from('fights').update({ bout_order: temp }).eq('id', a.id);
-    await supabase.from('fights').update({ bout_order: a.bout_order }).eq('id', b.id);
-    await supabase.from('fights').update({ bout_order: b.bout_order }).eq('id', a.id);
+    for (let i = 0; i < ids.length; i++) {
+      await supabase.from('fights').update({ bout_order: 10000 + i }).eq('id', ids[i]);
+    }
+    for (let i = 0; i < ids.length; i++) {
+      await supabase.from('fights').update({ bout_order: i + 1 }).eq('id', ids[i]);
+    }
     await load();
     setBusy(false);
+    setReordering(false);
   }
 
-  // Close gaps so bouts read 1..n after deletions or reshuffles. Two passes
-  // for the same unique-constraint reason as moveBout.
-  async function renumber() {
+  async function createFight(data: NewBout) {
     if (busy) return;
     setBusy(true);
-    for (let i = 0; i < fights.length; i++) {
-      await supabase.from('fights').update({ bout_order: 10000 + i }).eq('id', fights[i].id);
-    }
-    for (let i = 0; i < fights.length; i++) {
-      await supabase.from('fights').update({ bout_order: i + 1 }).eq('id', fights[i].id);
+    const nextOrder = Math.max(0, ...fights.map((f) => f.bout_order)) + 1;
+    const { data: created } = await supabase
+      .from('fights')
+      .insert({ event_id: eventId, bout_order: nextOrder, ...data })
+      .select('id')
+      .single();
+    if (created) {
+      // Create the round rows (all pending; the official opens R1 at bout start).
+      const rows = Array.from({ length: data.scheduled_rounds }, (_, i) => ({
+        fight_id: created.id,
+        round_number: i + 1,
+      }));
+      await supabase.from('rounds').insert(rows);
     }
     await load();
     setBusy(false);
@@ -131,8 +140,6 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
   }
   if (!event) return <Loading />;
 
-  const needsRenumber = fights.some((f, i) => f.bout_order !== i + 1);
-
   return (
     <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
       <header className="flex items-center gap-3">
@@ -153,35 +160,131 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
         )}
       </header>
 
-      {fights.length === 0 && (
-        <p className="text-sm text-slate-500">No bouts in this event yet. Add them from the events list.</p>
-      )}
+      {fights.length === 0 && <p className="text-sm text-slate-500">No bouts in this event yet.</p>}
 
-      {needsRenumber && (
-        <button
-          onClick={renumber}
-          disabled={busy}
-          className="h-10 w-full rounded-lg bg-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
-        >
-          Renumber bouts 1–{fights.length}
-        </button>
-      )}
-
-      {fights.map((f, i) => (
-        <BoutPanel
-          key={f.id}
-          fight={f}
-          judges={judges}
-          assigned={assignments[f.id] ?? []}
+      {reordering ? (
+        <ReorderList
+          fights={fights}
           busy={busy}
-          isFirst={i === 0}
-          isLast={i === fights.length - 1}
-          onMoveUp={() => moveBout(i, -1)}
-          onMoveDown={() => moveBout(i, 1)}
-          onToggle={toggleAssign}
+          onSave={saveOrder}
+          onCancel={() => setReordering(false)}
         />
-      ))}
+      ) : (
+        <>
+          {fights.length > 1 && (
+            <button
+              onClick={() => setReordering(true)}
+              disabled={busy}
+              className="h-10 w-full rounded-lg bg-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
+            >
+              ⇅ Reorder bouts
+            </button>
+          )}
+
+          {fights.map((f) => (
+            <BoutPanel
+              key={f.id}
+              fight={f}
+              judges={judges}
+              assigned={assignments[f.id] ?? []}
+              busy={busy}
+              onToggle={toggleAssign}
+            />
+          ))}
+
+          <CreateFight onCreate={createFight} busy={busy} />
+        </>
+      )}
     </div>
+  );
+}
+
+// Compact fixed-height rows dragged by the ≡ handle. Pointer events cover
+// both touch and mouse; the handle is touch-action none so the page does not
+// scroll while dragging.
+const ROW_PX = 56;
+
+function ReorderList({
+  fights,
+  busy,
+  onSave,
+  onCancel,
+}: {
+  fights: FightRow[];
+  busy: boolean;
+  onSave: (ids: string[]) => void;
+  onCancel: () => void;
+}) {
+  const [order, setOrder] = useState(() => fights.map((f) => f.id));
+  const [dragId, setDragId] = useState<string | null>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const byId = new Map(fights.map((f) => [f.id, f]));
+  const dirty = order.some((id, i) => fights[i]?.id !== id || byId.get(id)?.bout_order !== i + 1);
+
+  function onPointerMove(e: React.PointerEvent) {
+    if (!dragId || !listRef.current) return;
+    const top = listRef.current.getBoundingClientRect().top;
+    let idx = Math.floor((e.clientY - top) / ROW_PX);
+    idx = Math.max(0, Math.min(order.length - 1, idx));
+    const cur = order.indexOf(dragId);
+    if (idx !== cur) {
+      const next = [...order];
+      next.splice(cur, 1);
+      next.splice(idx, 0, dragId);
+      setOrder(next);
+    }
+  }
+
+  return (
+    <section className="space-y-3 rounded-2xl bg-slate-900 p-3">
+      <p className="text-xs text-slate-400">Drag the ≡ handle to set the running order.</p>
+      <div ref={listRef} onPointerMove={onPointerMove} onPointerUp={() => setDragId(null)}>
+        {order.map((id, i) => {
+          const f = byId.get(id);
+          if (!f) return null;
+          return (
+            <div
+              key={id}
+              style={{ height: ROW_PX }}
+              className={`flex items-center gap-3 border-b border-slate-800 px-2 last:border-b-0 ${
+                dragId === id ? 'rounded-lg bg-slate-700/60' : ''
+              }`}
+            >
+              <span className="w-6 text-lg font-black text-slate-500">{i + 1}</span>
+              <span className="min-w-0 flex-1 truncate text-sm font-bold">
+                {f.fighter_a_name} <span className="text-slate-500">vs</span> {f.fighter_b_name}
+              </span>
+              <button
+                onPointerDown={(e) => {
+                  e.currentTarget.setPointerCapture(e.pointerId);
+                  setDragId(id);
+                }}
+                className="touch-none px-3 py-2 text-xl text-slate-400"
+                aria-label={`Drag to reorder bout ${f.fighter_a_name} vs ${f.fighter_b_name}`}
+              >
+                ≡
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={() => onSave(order)}
+          disabled={busy || !dirty}
+          className="h-11 flex-1 rounded-xl bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
+        >
+          {busy ? 'Saving…' : 'Save order'}
+        </button>
+        <button
+          onClick={onCancel}
+          disabled={busy}
+          className="h-11 rounded-xl bg-slate-800 px-4 text-sm font-bold text-slate-300 disabled:opacity-40"
+        >
+          Cancel
+        </button>
+      </div>
+    </section>
   );
 }
 
@@ -190,20 +293,12 @@ function BoutPanel({
   judges,
   assigned,
   busy,
-  isFirst,
-  isLast,
-  onMoveUp,
-  onMoveDown,
   onToggle,
 }: {
   fight: FightRow;
   judges: JudgeRow[];
   assigned: string[];
   busy: boolean;
-  isFirst: boolean;
-  isLast: boolean;
-  onMoveUp: () => void;
-  onMoveDown: () => void;
   onToggle: (fightId: string, judgeId: string, assigned: boolean) => void;
 }) {
   const [adding, setAdding] = useState(false);
@@ -238,24 +333,6 @@ function BoutPanel({
           <p className="text-xs text-slate-400">
             {fight.weight_class} · {fight.scheduled_rounds} rounds
           </p>
-        </div>
-        <div className="flex shrink-0 gap-1">
-          <button
-            onClick={onMoveUp}
-            disabled={busy || isFirst}
-            className="h-9 w-9 rounded-lg bg-slate-800 text-sm font-black text-slate-300 disabled:opacity-30"
-            aria-label="Move bout up"
-          >
-            ▲
-          </button>
-          <button
-            onClick={onMoveDown}
-            disabled={busy || isLast}
-            className="h-9 w-9 rounded-lg bg-slate-800 text-sm font-black text-slate-300 disabled:opacity-30"
-            aria-label="Move bout down"
-          >
-            ▼
-          </button>
         </div>
       </div>
 
