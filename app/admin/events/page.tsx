@@ -159,13 +159,15 @@ export default function EventsPage() {
       {events.map((ev) => (
         <section key={ev.id} className="space-y-3 rounded-2xl bg-slate-900 p-4">
           <div className="flex items-center justify-between gap-2">
-            <div>
-              <h2 className="text-lg font-black">{ev.name}</h2>
+            <Link href={`/admin/events/${ev.id}`} className="min-w-0">
+              <h2 className="truncate text-lg font-black underline decoration-slate-700 underline-offset-4">
+                {ev.name}
+              </h2>
               <p className="text-xs text-slate-400">
                 {ev.event_date}
-                {ev.region ? ` · ${ev.region}` : ''}
+                {ev.region ? ` · ${ev.region}` : ''} · run sheet ›
               </p>
-            </div>
+            </Link>
             <button
               onClick={() => toggleLive(ev.id, ev.is_live)}
               disabled={busy}
