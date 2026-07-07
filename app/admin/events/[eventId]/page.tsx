@@ -45,7 +45,9 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
   const [notFound, setNotFound] = useState(false);
 
   const load = useCallback(async () => {
-    const [{ data: ev }, { data: fi }, { data: pr }, { data: fj }] = await Promise.all([
+    // Assignments come embedded on this event's fights, so only rows for this
+    // event cross the wire (not the whole fight_judges table).
+    const [{ data: ev }, { data: fi }, { data: pr }] = await Promise.all([
       supabase
         .from('events')
         .select('id, name, event_date, region, is_live')
@@ -53,22 +55,24 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
         .maybeSingle(),
       supabase
         .from('fights')
-        .select('id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state')
+        .select(
+          'id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, fight_judges(judge_id)',
+        )
         .eq('event_id', eventId)
         .order('bout_order'),
       supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
-      supabase.from('fight_judges').select('fight_id, judge_id'),
     ]);
     if (!ev) {
       setNotFound(true);
       return;
     }
     setEvent(ev as EventRow);
-    setFights((fi ?? []) as FightRow[]);
+    const rows = (fi ?? []) as (FightRow & { fight_judges?: { judge_id: string }[] })[];
+    setFights(rows.map(({ fight_judges, ...f }) => f));
     setJudges((pr ?? []).map((p) => ({ id: p.id, name: p.full_name })));
     const map: Record<string, string[]> = {};
-    (fj ?? []).forEach((row) => {
-      (map[row.fight_id] ??= []).push(row.judge_id);
+    rows.forEach((r) => {
+      map[r.id] = (r.fight_judges ?? []).map((fj) => fj.judge_id);
     });
     setAssignments(map);
   }, [supabase, eventId]);
