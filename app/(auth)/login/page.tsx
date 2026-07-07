@@ -71,9 +71,13 @@ export default function LoginPage() {
   }, [supabase, signedInUserId]);
 
   // Approved judges see their assigned bouts right here, no link-passing
-  // needed. RLS already scopes both queries to the signed-in judge.
+  // needed. RLS already scopes both queries to the signed-in judge. We also
+  // fetch when the status is unknown (null: offline or a transient profile
+  // read failure) because the signed-in view falls back to the dashboard in
+  // that case, so its bout list must be populated too. Pending and suspended
+  // judges get their banner instead and have no assignments anyway.
   useEffect(() => {
-    if (!signedInUserId || profileStatus !== 'approved') {
+    if (!signedInUserId || profileStatus === 'pending' || profileStatus === 'suspended') {
       setBouts([]);
       setPastBouts([]);
       return;
