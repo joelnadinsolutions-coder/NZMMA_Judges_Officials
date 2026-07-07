@@ -22,6 +22,16 @@ interface Fight {
 type SubmitState = 'idle' | 'submitting' | 'saved' | 'pending' | 'error';
 type RoundState = 'pending' | 'live' | 'locked';
 type SavedScore = { a: number; b: number; note: string | null; tag: MarginTag | null };
+type FinishMethod = 'ko' | 'tko' | 'submission' | 'dq' | 'other';
+type FinishFlag = { round_number: number; method: FinishMethod; note: string | null };
+
+const FINISH_LABEL: Record<FinishMethod, string> = {
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  other: 'Other',
+};
 
 // Every option references a stable module constant, so we can identify the
 // current pick by reference (labels now collide across columns: A and B both
@@ -44,6 +54,11 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const [roundStates, setRoundStates] = useState<Record<number, RoundState>>({});
   const [deductions, setDeductions] = useState<Record<number, { a: number; b: number }>>({});
   const [savedScores, setSavedScores] = useState<Record<number, SavedScore>>({});
+  const [finishFlag, setFinishFlag] = useState<FinishFlag | null>(null);
+  const [flagging, setFlagging] = useState(false);
+  const [flagMethod, setFlagMethod] = useState<FinishMethod>('tko');
+  const [flagNote, setFlagNote] = useState('');
+  const [flagBusy, setFlagBusy] = useState(false);
 
   // Ref mirror of savedScores so round switches read the latest map without
   // re-subscribing effects.
@@ -88,7 +103,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     let active = true;
 
     async function load() {
-      const [{ data: scoreRows }, { data: roundRows }] = await Promise.all([
+      const [{ data: scoreRows }, { data: roundRows }, { data: flagRows }] = await Promise.all([
         supabase
           .from('scores')
           .select('round_number, fighter_a_score, fighter_b_score, note, margin_tag')
@@ -98,8 +113,15 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           .from('rounds')
           .select('round_number, state, fighter_a_deduction, fighter_b_deduction')
           .eq('fight_id', fight.id),
+        supabase
+          .from('judge_finish_flags')
+          .select('round_number, method, note')
+          .eq('fight_id', fight.id)
+          .eq('judge_id', judgeId),
       ]);
       if (!active) return;
+
+      setFinishFlag((flagRows?.[0] as FinishFlag | undefined) ?? null);
 
       const scores: Record<number, SavedScore> = {};
       scoreRows?.forEach((r) => {
@@ -175,9 +197,44 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const roundLive = roundState === 'live';
   const roundLocked = roundState === 'locked';
 
-  // Can only pick/edit a score on a live round that has not been submitted yet.
-  const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved';
+  // Can only pick/edit a score on a live round that has not been submitted
+  // yet, and not after this judge has marked the fight finished.
+  const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved' || !!finishFlag;
   const confirmDisabled = pickDisabled || !selected || !judgeId;
+
+  // The judge's own finish observation. Closes THEIR card only: the official
+  // still closes the bout, and the official's result always overrules this.
+  async function saveFinishFlag() {
+    if (!judgeId || flagBusy) return;
+    setFlagBusy(true);
+    const { error } = await supabase.from('judge_finish_flags').upsert(
+      {
+        fight_id: fight.id,
+        judge_id: judgeId,
+        round_number: round,
+        method: flagMethod,
+        note: flagNote.trim() || null,
+      },
+      { onConflict: 'fight_id,judge_id' },
+    );
+    if (!error) {
+      setFinishFlag({ round_number: round, method: flagMethod, note: flagNote.trim() || null });
+      setFlagging(false);
+    }
+    setFlagBusy(false);
+  }
+
+  async function undoFinishFlag() {
+    if (!judgeId || flagBusy) return;
+    setFlagBusy(true);
+    const { error } = await supabase
+      .from('judge_finish_flags')
+      .delete()
+      .eq('fight_id', fight.id)
+      .eq('judge_id', judgeId);
+    if (!error) setFinishFlag(null);
+    setFlagBusy(false);
+  }
 
   const handleConfirm = useCallback(async () => {
     // ---- STATE LOCK: block re-entry so a double-tap can't double-submit ----
@@ -326,12 +383,82 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       )}
 
       {/* ---- Round status banner ---- */}
-      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && (
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && !finishFlag && (
         <p className="mx-4 mb-2 rounded-lg bg-slate-800/60 px-3 py-2 text-center text-xs font-semibold text-slate-300">
           {roundLocked
             ? 'Round locked. Scores are final.'
             : 'This round is not open yet. Waiting for the official to start it.'}
         </p>
+      )}
+
+      {/* ---- Judge finish flag: closes this judge's card only ---- */}
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <div className="mx-4 mb-2">
+          {finishFlag ? (
+            <div className="space-y-2 rounded-lg bg-amber-500/10 px-3 py-2 ring-1 ring-amber-500/30">
+              <p className="text-center text-xs font-semibold text-amber-300">
+                You marked this fight finished in R{finishFlag.round_number} by{' '}
+                {FINISH_LABEL[finishFlag.method]}
+                {finishFlag.note ? ` (${finishFlag.note})` : ''}. Your card is closed; the
+                official records the result.
+              </p>
+              <button
+                onClick={undoFinishFlag}
+                disabled={flagBusy}
+                className="mx-auto block text-xs font-semibold text-amber-200 underline underline-offset-2 disabled:opacity-40"
+              >
+                Undo
+              </button>
+            </div>
+          ) : flagging ? (
+            <div className="space-y-2 rounded-lg bg-slate-900 p-3 ring-1 ring-slate-700">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                Fight finished in round {round}: how?
+              </p>
+              <div className="grid grid-cols-5 gap-1">
+                {(Object.keys(FINISH_LABEL) as FinishMethod[]).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setFlagMethod(m)}
+                    className={`h-10 rounded-lg text-[11px] font-bold uppercase transition ${
+                      flagMethod === m ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
+                    }`}
+                  >
+                    {FINISH_LABEL[m]}
+                  </button>
+                ))}
+              </div>
+              <input
+                value={flagNote}
+                onChange={(e) => setFlagNote(e.target.value)}
+                placeholder="Detail (e.g. knockout via punch)"
+                className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={saveFinishFlag}
+                  disabled={flagBusy}
+                  className="h-10 flex-1 rounded-lg bg-amber-500 text-xs font-bold text-slate-950 disabled:opacity-40"
+                >
+                  Confirm (closes my card)
+                </button>
+                <button
+                  onClick={() => setFlagging(false)}
+                  className="h-10 rounded-lg bg-slate-800 px-4 text-xs font-bold text-slate-300"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setFlagging(true)}
+              className="mx-auto block text-xs font-semibold text-slate-400 underline decoration-dotted underline-offset-2"
+            >
+              Fight finished? Mark it
+            </button>
+          )}
+        </div>
       )}
 
       {/* ---- Fighter columns ---- */}

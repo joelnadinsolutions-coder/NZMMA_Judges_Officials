@@ -53,6 +53,20 @@ interface Submission {
   full: string;
   score: ScoreRow | null;
 }
+interface FinishFlagRow {
+  judge_id: string;
+  round_number: number;
+  method: 'ko' | 'tko' | 'submission' | 'dq' | 'other';
+  note: string | null;
+}
+
+const FLAG_METHOD_LABEL: Record<FinishFlagRow['method'], string> = {
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  other: 'Other',
+};
 
 // "Jay Nadin" -> "Jay N"; falls back to the local part of an email.
 function abbrev(name: string): string {
@@ -118,6 +132,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const [rounds, setRounds] = useState<Round[]>([]);
   const [judges, setJudges] = useState<Judge[]>([]);
   const [scores, setScores] = useState<ScoreRow[]>([]);
+  const [finishFlags, setFinishFlags] = useState<FinishFlagRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -167,6 +182,12 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .select('round_number, judge_id, fighter_a_score, fighter_b_score, note, margin_tag')
       .eq('fight_id', fightId);
     setScores((sc ?? []) as ScoreRow[]);
+
+    const { data: fl } = await supabase
+      .from('judge_finish_flags')
+      .select('judge_id, round_number, method, note')
+      .eq('fight_id', fightId);
+    setFinishFlags((fl ?? []) as FinishFlagRow[]);
   }, [supabase, fightId]);
 
   useEffect(() => {
@@ -186,6 +207,11 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'scores', filter: `fight_id=eq.${fightId}` },
+        () => load(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'judge_finish_flags', filter: `fight_id=eq.${fightId}` },
         () => load(),
       )
       .subscribe();
@@ -347,6 +373,29 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         <section className="rounded-2xl bg-red-500/10 p-4 text-center ring-1 ring-red-500/30">
           <p className="text-lg font-black text-red-300">Bout cancelled</p>
           {fight.result_note && <p className="mt-1 text-sm text-red-200/80">{fight.result_note}</p>}
+        </section>
+      )}
+
+      {/* Judges' finish observations: informational, the official's closure
+          below is the authoritative result. */}
+      {finishFlags.length > 0 && fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <section className="space-y-1 rounded-2xl bg-amber-500/10 p-3 ring-1 ring-amber-500/30">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-amber-300">
+            Judges flagged a finish
+          </p>
+          {finishFlags.map((fl) => {
+            const j = judges.find((x) => x.id === fl.judge_id);
+            return (
+              <p key={fl.judge_id} className="text-sm text-amber-200">
+                <span className="font-bold">{abbrev(j?.name ?? 'Judge')}</span>:{' '}
+                {FLAG_METHOD_LABEL[fl.method]} in R{fl.round_number}
+                {fl.note ? ` (${fl.note})` : ''}
+              </p>
+            );
+          })}
+          <p className="text-[11px] text-amber-200/70">
+            Close the bout below to record the official result.
+          </p>
         </section>
       )}
 
