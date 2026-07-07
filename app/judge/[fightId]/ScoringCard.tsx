@@ -226,6 +226,17 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fight.current_round]);
 
+  // Release a held switch as soon as it is no longer blocked: the score got
+  // confirmed, or the round locked out from under the judge (which makes the
+  // pick unsubmittable anyway). Without this the amber "submit first" banner
+  // could point at a disabled CONFIRM button, a dead end.
+  useEffect(() => {
+    if (blockedTarget !== null && !hasUnconfirmedPick()) {
+      setRound(blockedTarget);
+      setBlockedTarget(null);
+    }
+  }, [blockedTarget, hasUnconfirmedPick]);
+
   const cornerClass = (corner: string) =>
     corner === 'red' ? 'ring-red-500/70' : corner === 'blue' ? 'ring-sky-500/70' : 'ring-slate-500/70';
 
@@ -243,18 +254,22 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   async function saveFinishFlag() {
     if (!judgeId || flagBusy) return;
     setFlagBusy(true);
+    // Record the live round the official is on, not whichever tab the judge is
+    // viewing, so a finish flagged while reviewing an earlier round is not
+    // misattributed.
+    const finishRound = fight.current_round;
     const { error } = await supabase.from('judge_finish_flags').upsert(
       {
         fight_id: fight.id,
         judge_id: judgeId,
-        round_number: round,
+        round_number: finishRound,
         method: flagMethod,
         note: flagNote.trim() || null,
       },
       { onConflict: 'fight_id,judge_id' },
     );
     if (!error) {
-      setFinishFlag({ round_number: round, method: flagMethod, note: flagNote.trim() || null });
+      setFinishFlag({ round_number: finishRound, method: flagMethod, note: flagNote.trim() || null });
       setFlagging(false);
     }
     setFlagBusy(false);
@@ -297,15 +312,12 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       setSavedScores(savedRef.current);
       setSubmit(reachedServer ? 'saved' : 'pending');
       setQueued(await pendingCount());
-      // A held round switch proceeds now that the score is in.
-      if (blockedTarget !== null) {
-        setRound(blockedTarget);
-        setBlockedTarget(null);
-      }
+      // A held round switch is released by the blockedTarget effect once submit
+      // flips away from an unconfirmed pick.
     } catch {
       setSubmit('error');
     }
-  }, [confirmDisabled, selected, judgeId, fight.id, round, note, marginTag, blockedTarget]);
+  }, [confirmDisabled, selected, judgeId, fight.id, round, note, marginTag]);
 
   const roundOptions = useMemo(
     () => Array.from({ length: fight.scheduled_rounds }, (_, i) => i + 1),
@@ -463,7 +475,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           ) : flagging ? (
             <div className="space-y-2 rounded-lg bg-slate-900 p-3 ring-1 ring-slate-700">
               <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
-                Fight finished in round {round}: how?
+                Fight finished in round {fight.current_round}: how?
               </p>
               <div className="grid grid-cols-5 gap-1">
                 {(Object.keys(FINISH_LABEL) as FinishMethod[]).map((m) => (
