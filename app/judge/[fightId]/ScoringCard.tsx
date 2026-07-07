@@ -185,9 +185,45 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     applyRound(round);
   }, [round, applyRound]);
 
+  // A round switch (official advancing, or the judge tapping a tab) does not
+  // silently discard a picked-but-unconfirmed score: the card holds with a
+  // prompt, advances once the score is confirmed, or leaves on a second tap.
+  const [blockedTarget, setBlockedTarget] = useState<number | null>(null);
+
+  const hasUnconfirmedPick = useCallback(() => {
+    return (
+      roundStates[round] === 'live' &&
+      !!selected &&
+      submit !== 'saved' &&
+      submit !== 'pending' &&
+      submit !== 'submitting'
+    );
+  }, [roundStates, round, selected, submit]);
+
+  const requestRound = useCallback(
+    (target: number) => {
+      if (target === round) return;
+      if (hasUnconfirmedPick() && blockedTarget !== target) {
+        setBlockedTarget(target);
+        return;
+      }
+      setBlockedTarget(null);
+      setRound(target);
+    },
+    [round, hasUnconfirmedPick, blockedTarget],
+  );
+
   // Follow the official when they advance the live round.
   useEffect(() => {
+    if (fight.current_round === round) return;
+    if (hasUnconfirmedPick()) {
+      setBlockedTarget(fight.current_round);
+      return;
+    }
+    setBlockedTarget(null);
     setRound(fight.current_round);
+    // Only the official's advance should trigger this follow.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fight.current_round]);
 
   const cornerClass = (corner: string) =>
@@ -261,10 +297,15 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       setSavedScores(savedRef.current);
       setSubmit(reachedServer ? 'saved' : 'pending');
       setQueued(await pendingCount());
+      // A held round switch proceeds now that the score is in.
+      if (blockedTarget !== null) {
+        setRound(blockedTarget);
+        setBlockedTarget(null);
+      }
     } catch {
       setSubmit('error');
     }
-  }, [confirmDisabled, selected, judgeId, fight.id, round, note, marginTag]);
+  }, [confirmDisabled, selected, judgeId, fight.id, round, note, marginTag, blockedTarget]);
 
   const roundOptions = useMemo(
     () => Array.from({ length: fight.scheduled_rounds }, (_, i) => i + 1),
@@ -320,7 +361,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           return (
             <button
               key={r}
-              onClick={() => setRound(r)}
+              onClick={() => requestRound(r)}
               className={`relative h-12 flex-1 rounded-xl text-lg font-bold transition ${
                 isCur ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
               }`}
@@ -380,6 +421,15 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
             Back to your bouts
           </Link>
         </div>
+      )}
+
+      {/* ---- Unsubmitted score hold ---- */}
+      {blockedTarget !== null && (
+        <p className="mx-4 mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-center text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30">
+          Round {blockedTarget} is waiting, but this round&apos;s score is not submitted. Tap
+          CONFIRM SCORE to submit it, or tap round {blockedTarget} again to leave without
+          submitting.
+        </p>
       )}
 
       {/* ---- Round status banner ---- */}
