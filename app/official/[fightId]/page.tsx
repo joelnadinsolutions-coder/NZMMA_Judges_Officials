@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 
 type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
@@ -314,9 +315,14 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
       <header>
         <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            NZMMAF · Official control
-          </p>
+          <div className="flex items-center gap-2">
+            <Link href="/admin/events" className="text-lg leading-none text-slate-500">
+              ‹
+            </Link>
+            <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+              NZMMAF · Official control
+            </p>
+          </div>
           <FightStateBadge state={fight.state} />
         </div>
         <h1 className="mt-1 text-2xl font-black">

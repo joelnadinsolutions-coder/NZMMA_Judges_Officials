@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { enqueueScore, pendingCount, registerAutoFlush } from '@/lib/offlineQueue';
 import { A_WINS, B_WINS, EVEN, type MarginTag, type ScoreOption } from '@/lib/scoring';
@@ -236,8 +237,13 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     <div className="mx-auto flex min-h-dvh max-w-md flex-col bg-slate-950 text-slate-50">
       {/* ---- Status bar ---- */}
       <header className="flex items-center justify-between px-4 pt-[max(env(safe-area-inset-top),1rem)] pb-3">
-        <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-          NZMMAF · Roundmaster
+        <span className="flex items-center gap-2">
+          <Link href="/login" className="text-lg leading-none text-slate-500">
+            ‹
+          </Link>
+          <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+            NZMMAF · Roundmaster
+          </span>
         </span>
         <span
           className={`rounded-full px-3 py-1 text-xs font-bold ${
