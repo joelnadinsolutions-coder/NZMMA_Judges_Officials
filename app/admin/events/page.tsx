@@ -126,10 +126,12 @@ export default function EventsPage() {
   async function setArchived(eventId: string, archived: boolean) {
     if (busy) return;
     setBusy(true);
-    await supabase
-      .from('events')
-      .update({ archived_at: archived ? new Date().toISOString() : null, is_live: false })
-      .eq('id', eventId);
+    // Archiving also takes the event off live; unarchiving leaves is_live
+    // alone so it comes back in whatever state it was.
+    const patch = archived
+      ? { archived_at: new Date().toISOString(), is_live: false }
+      : { archived_at: null };
+    await supabase.from('events').update(patch).eq('id', eventId);
     await load();
     setBusy(false);
   }

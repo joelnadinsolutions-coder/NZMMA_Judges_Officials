@@ -41,6 +41,7 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
   const [assignments, setAssignments] = useState<Record<string, string[]>>({});
   const [busy, setBusy] = useState(false);
   const [reordering, setReordering] = useState(false);
+  const [reorderError, setReorderError] = useState<string | null>(null);
   const [notFound, setNotFound] = useState(false);
 
   const load = useCallback(async () => {
@@ -85,15 +86,29 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
   async function saveOrder(ids: string[]) {
     if (busy) return;
     setBusy(true);
-    for (let i = 0; i < ids.length; i++) {
-      await supabase.from('fights').update({ bout_order: 10000 + i }).eq('id', ids[i]);
+    setReorderError(null);
+    // Phase 1 parks every bout at a temporary out-of-range number so phase 2
+    // can assign 1..n without tripping the per-event unique constraint. If
+    // any write fails we stop, reload to show the real state, and keep the
+    // reorder open so the official can retry rather than leaving bouts
+    // stranded at 10000+ silently.
+    try {
+      for (let i = 0; i < ids.length; i++) {
+        const { error } = await supabase.from('fights').update({ bout_order: 10000 + i }).eq('id', ids[i]);
+        if (error) throw error;
+      }
+      for (let i = 0; i < ids.length; i++) {
+        const { error } = await supabase.from('fights').update({ bout_order: i + 1 }).eq('id', ids[i]);
+        if (error) throw error;
+      }
+      await load();
+      setReordering(false);
+    } catch {
+      await load();
+      setReorderError('Could not save the new order. Check your connection and try again.');
+    } finally {
+      setBusy(false);
     }
-    for (let i = 0; i < ids.length; i++) {
-      await supabase.from('fights').update({ bout_order: i + 1 }).eq('id', ids[i]);
-    }
-    await load();
-    setBusy(false);
-    setReordering(false);
   }
 
   async function createFight(data: NewBout) {
@@ -166,8 +181,12 @@ export default function EventDetailPage({ params }: { params: Promise<{ eventId:
         <ReorderList
           fights={fights}
           busy={busy}
+          error={reorderError}
           onSave={saveOrder}
-          onCancel={() => setReordering(false)}
+          onCancel={() => {
+            setReorderError(null);
+            setReordering(false);
+          }}
         />
       ) : (
         <>
@@ -207,11 +226,13 @@ const ROW_PX = 56;
 function ReorderList({
   fights,
   busy,
+  error,
   onSave,
   onCancel,
 }: {
   fights: FightRow[];
   busy: boolean;
+  error: string | null;
   onSave: (ids: string[]) => void;
   onCancel: () => void;
 }) {
@@ -238,6 +259,11 @@ function ReorderList({
   return (
     <section className="space-y-3 rounded-2xl bg-slate-900 p-3">
       <p className="text-xs text-slate-400">Drag the ≡ handle to set the running order.</p>
+      {error && (
+        <p className="rounded-lg bg-red-500/10 px-3 py-2 text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
+          {error}
+        </p>
+      )}
       <div ref={listRef} onPointerMove={onPointerMove} onPointerUp={() => setDragId(null)}>
         {order.map((id, i) => {
           const f = byId.get(id);
