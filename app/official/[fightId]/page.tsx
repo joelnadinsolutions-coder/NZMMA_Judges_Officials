@@ -136,8 +136,9 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    // RLS returns these only to officials/admins.
+  // Each table has its own loader so a realtime change refetches only the slice
+  // that moved, not the whole page. RLS returns these only to officials/admins.
+  const loadFight = useCallback(async () => {
     const { data: f, error: fErr } = await supabase
       .from('fights')
       .select(
@@ -150,15 +151,18 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       return;
     }
     setFight(f as Fight);
+  }, [supabase, fightId]);
 
-    const { data: r } = await supabase
+  const loadRounds = useCallback(async () => {
+    const { data } = await supabase
       .from('rounds')
       .select('round_number, state, fighter_a_deduction, fighter_b_deduction, deduction_note')
       .eq('fight_id', fightId)
       .order('round_number');
-    setRounds((r ?? []) as Round[]);
+    setRounds((data ?? []) as Round[]);
+  }, [supabase, fightId]);
 
-    // Assigned judges (names) and every judge's submitted cards.
+  const loadJudges = useCallback(async () => {
     const { data: fj } = await supabase
       .from('fight_judges')
       .select('judge_id, seat')
@@ -167,58 +171,65 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const ids = (fj ?? []).map((row) => row.judge_id as string);
     const names: Record<string, string> = {};
     if (ids.length) {
-      const { data: profs } = await supabase
-        .from('profiles')
-        .select('id, full_name')
-        .in('id', ids);
+      const { data: profs } = await supabase.from('profiles').select('id, full_name').in('id', ids);
       profs?.forEach((p) => {
         names[p.id] = p.full_name;
       });
     }
     setJudges(ids.map((id) => ({ id, name: names[id] ?? id.slice(0, 8) })));
+  }, [supabase, fightId]);
 
-    const { data: sc } = await supabase
+  const loadScores = useCallback(async () => {
+    const { data } = await supabase
       .from('scores')
       .select('round_number, judge_id, fighter_a_score, fighter_b_score, note, margin_tag')
       .eq('fight_id', fightId);
-    setScores((sc ?? []) as ScoreRow[]);
+    setScores((data ?? []) as ScoreRow[]);
+  }, [supabase, fightId]);
 
-    const { data: fl } = await supabase
+  const loadFlags = useCallback(async () => {
+    const { data } = await supabase
       .from('judge_finish_flags')
       .select('judge_id, round_number, method, note')
       .eq('fight_id', fightId);
-    setFinishFlags((fl ?? []) as FinishFlagRow[]);
+    setFinishFlags((data ?? []) as FinishFlagRow[]);
   }, [supabase, fightId]);
 
+  // Refresh everything at once (initial mount and after the official's own
+  // mutations), running the slice loaders in parallel.
+  const reloadAll = useCallback(async () => {
+    await Promise.all([loadFight(), loadRounds(), loadJudges(), loadScores(), loadFlags()]);
+  }, [loadFight, loadRounds, loadJudges, loadScores, loadFlags]);
+
   useEffect(() => {
-    load();
+    reloadAll();
     const channel = supabase
       .channel(`official-${fightId}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rounds', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadRounds(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'fights', filter: `id=eq.${fightId}` },
-        () => load(),
+        () => loadFight(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'scores', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadScores(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'judge_finish_flags', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadFlags(),
       )
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, fightId, load]);
+  }, [supabase, fightId, reloadAll, loadRounds, loadFight, loadScores, loadFlags]);
 
   async function openRound(n: number) {
     if (busy) return;
@@ -229,7 +240,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const patch: Partial<Fight> = { current_round: n };
     if (fight?.state === 'scheduled') patch.state = 'in_progress';
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -244,7 +255,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       note: note || null,
     });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -255,7 +266,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ state: 'cancelled', result_note: note || null })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -265,7 +276,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     // lock_round() also locks every judge's card for the round.
     const { error: rpcErr } = await supabase.rpc('lock_round', { f_id: fightId, r_num: n });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -277,7 +288,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .update({ fighter_a_deduction: a, fighter_b_deduction: b, deduction_note: note || null })
       .eq('fight_id', fightId)
       .eq('round_number', n);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -285,7 +296,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     if (busy) return;
     setBusy(true);
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -296,7 +307,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ scheduled_rounds, round_minutes, is_championship })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
