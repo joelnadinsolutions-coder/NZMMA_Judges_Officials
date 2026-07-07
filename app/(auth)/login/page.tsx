@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 
 type Mode = 'signin' | 'signup' | 'magic';
+type ProfileStatus = 'pending' | 'approved' | 'suspended';
 
 export default function LoginPage() {
   const supabase = getSupabase();
@@ -15,19 +16,49 @@ export default function LoginPage() {
   const [notice, setNotice] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [signedInEmail, setSignedInEmail] = useState<string | null>(null);
+  const [signedInUserId, setSignedInUserId] = useState<string | null>(null);
+  const [profileStatus, setProfileStatus] = useState<ProfileStatus | null>(null);
 
   // When a magic link redirects back here, the client picks up the session
   // from the URL (detectSessionInUrl). Reflect that so it does not look like a
   // loop back to the sign-in form.
   useEffect(() => {
-    supabase.auth
-      .getSession()
-      .then(({ data }) => setSignedInEmail(data.session?.user?.email ?? null));
+    supabase.auth.getSession().then(({ data }) => {
+      setSignedInEmail(data.session?.user?.email ?? null);
+      setSignedInUserId(data.session?.user?.id ?? null);
+    });
     const { data: sub } = supabase.auth.onAuthStateChange((_event, session) => {
       setSignedInEmail(session?.user?.email ?? null);
+      setSignedInUserId(session?.user?.id ?? null);
     });
     return () => sub.subscription.unsubscribe();
   }, [supabase]);
+
+  // With email confirmations off, a fresh signup is signed in instantly and
+  // the signed-in view replaces the form, so the "an official must approve
+  // you" notice was never seen. Fetch the profile status (RLS allows reading
+  // your own row) and surface a pending banner in the signed-in view instead.
+  useEffect(() => {
+    if (!signedInUserId) {
+      setProfileStatus(null);
+      return;
+    }
+    let cancelled = false;
+    supabase
+      .from('profiles')
+      .select('status')
+      .eq('id', signedInUserId)
+      .single()
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        // On error (offline, row not yet created) leave status unknown and
+        // fall back to the plain signed-in view.
+        setProfileStatus(error ? null : ((data?.status as ProfileStatus) ?? null));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [supabase, signedInUserId]);
 
   function resetMessages() {
     setErr(null);
@@ -109,15 +140,30 @@ export default function LoginPage() {
             <p className="rounded-xl bg-emerald-500/15 p-4 text-emerald-300">
               Signed in as {signedInEmail}.
             </p>
-            <p className="text-sm text-slate-400">
-              Open the bout link an official gives you to start scoring.
-            </p>
-            <Link
-              href="/admin"
-              className="block h-12 rounded-xl bg-slate-50 text-sm font-bold leading-[3rem] text-slate-950"
-            >
-              Officials dashboard
-            </Link>
+            {profileStatus === 'pending' && (
+              <p className="rounded-xl bg-amber-500/15 p-4 text-amber-300">
+                Your account is awaiting approval. An official must approve you
+                before you can score.
+              </p>
+            )}
+            {profileStatus === 'suspended' && (
+              <p className="rounded-xl bg-red-500/15 p-4 text-red-300">
+                Your account is suspended. Contact an NZMMAF official.
+              </p>
+            )}
+            {(profileStatus === 'approved' || profileStatus === null) && (
+              <>
+                <p className="text-sm text-slate-400">
+                  Open the bout link an official gives you to start scoring.
+                </p>
+                <Link
+                  href="/admin"
+                  className="block h-12 rounded-xl bg-slate-50 text-sm font-bold leading-[3rem] text-slate-950"
+                >
+                  Officials dashboard
+                </Link>
+              </>
+            )}
             <button
               onClick={signOut}
               className="h-12 w-full rounded-xl bg-slate-800 text-sm font-semibold text-slate-300"
