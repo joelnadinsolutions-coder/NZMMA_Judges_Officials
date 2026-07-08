@@ -416,12 +416,32 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       setSavedScores(savedRef.current);
       setSubmit(reachedServer ? 'saved' : 'pending');
       setQueued(await pendingCount());
+      // Whole-bout-live flow: once saved, hop to the next open, unscored round
+      // so the judge can score straight through without waiting on the official.
+      const next = round + 1;
+      if (
+        next <= fight.scheduled_rounds &&
+        (roundStates[next] ?? 'pending') === 'live' &&
+        !savedRef.current[next]
+      ) {
+        setRound(next);
+      }
       // A held round switch is released by the blockedTarget effect once submit
       // flips away from an unconfirmed pick.
     } catch {
       setSubmit('error');
     }
-  }, [confirmDisabled, selected, judgeId, fight.id, round, note, roundNote]);
+  }, [
+    confirmDisabled,
+    selected,
+    judgeId,
+    fight.id,
+    fight.scheduled_rounds,
+    round,
+    roundStates,
+    note,
+    roundNote,
+  ]);
 
   const roundOptions = useMemo(
     () => Array.from({ length: fight.scheduled_rounds }, (_, i) => i + 1),

@@ -271,6 +271,31 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     setBusy(false);
   }
 
+  // Liven the whole bout at once: every round that is not already locked goes
+  // live, so the assigned judges score straight through (in order) without the
+  // official opening each round one at a time.
+  async function startBout() {
+    if (busy) return;
+    setBusy(true);
+    await supabase
+      .from('rounds')
+      .update({ state: 'live', started_at: new Date().toISOString() })
+      .eq('fight_id', fightId)
+      .neq('state', 'locked');
+    // Only reset the follow-round when kicking off a scheduled bout, so
+    // re-livening mid-bout does not yank judges back to round 1.
+    const patch: Partial<Fight> = {};
+    if (fight?.state === 'scheduled') {
+      patch.state = 'in_progress';
+      patch.current_round = 1;
+    }
+    if (Object.keys(patch).length > 0) {
+      await supabase.from('fights').update(patch).eq('id', fightId);
+    }
+    await reloadAll();
+    setBusy(false);
+  }
+
   async function closeBout(method: ResultMethod, winner: ResultWinner | null, atRound: number | null, note: string) {
     if (busy) return;
     setBusy(true);
@@ -506,7 +531,20 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       </div>
 
       <section className="space-y-3">
-        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Rounds</h2>
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Rounds</h2>
+          {fight.state !== 'completed' &&
+            fight.state !== 'cancelled' &&
+            rounds.some((r) => r.state === 'pending') && (
+              <button
+                onClick={startBout}
+                disabled={busy}
+                className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white disabled:opacity-40"
+              >
+                Start bout · all rounds live
+              </button>
+            )}
+        </div>
         {rounds.map((r) => (
           <RoundControl
             key={r.round_number}
