@@ -140,6 +140,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const [finishFlags, setFinishFlags] = useState<FinishFlagRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
 
   // Each table has its own loader so a realtime change refetches only the slice
   // that moved, not the whole page. RLS returns these only to officials/admins.
@@ -390,6 +391,11 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const shortA = fight.fighter_a_name.split(' ')[0];
   const shortB = fight.fighter_b_name.split(' ')[0];
 
+  // Corner-keyed names for the Red/Blue scorecard headings.
+  const redIsA = fight.fighter_a_corner === 'red';
+  const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
+  const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
+
   // Each judge's pick, then the combined decision.
   const results: JudgeResult[] = totals.map((t) => (t.a > t.b ? 'a' : t.b > t.a ? 'b' : 'draw'));
   const decision = decisionLabel(results, shortA, shortB);
@@ -400,7 +406,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const suggestedWinner = majorityWinner(results);
 
   return (
-    <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
+    <div className="mx-auto min-h-dvh max-w-md space-y-3 bg-slate-950 px-4 py-5 text-slate-50">
       <header>
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
@@ -413,8 +419,15 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
           </div>
           <FightStateBadge state={fight.state} />
         </div>
-        <h1 className="mt-1 text-2xl font-black">
-          {fight.fighter_a_name} <span className="text-slate-500">vs</span> {fight.fighter_b_name}
+        <h1 className="mt-1 space-y-0.5 text-lg font-black leading-tight">
+          <span className="block">
+            <span className="text-[11px] font-bold uppercase tracking-widest text-red-400">Red</span>{' '}
+            {redName}
+          </span>
+          <span className="block">
+            <span className="text-[11px] font-bold uppercase tracking-widest text-sky-400">Blue</span>{' '}
+            {blueName}
+          </span>
         </h1>
       </header>
 
@@ -477,9 +490,20 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         </section>
       )}
 
-      <BoutDetailsEditor fight={fight} onSave={saveDetails} busy={busy} />
-
-      <FormatEditor fight={fight} onSave={saveFormat} busy={busy} />
+      <div className="space-y-3">
+        <button
+          onClick={() => setShowSetup((s) => !s)}
+          className="w-full rounded-xl bg-slate-900 px-4 py-2 text-left text-xs font-bold uppercase tracking-widest text-slate-400"
+        >
+          {showSetup ? '▾' : '▸'} Setup (names, corners, format)
+        </button>
+        {showSetup && (
+          <>
+            <BoutDetailsEditor fight={fight} onSave={saveDetails} busy={busy} />
+            <FormatEditor fight={fight} onSave={saveFormat} busy={busy} />
+          </>
+        )}
+      </div>
 
       <section className="space-y-3">
         <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Rounds</h2>
@@ -511,13 +535,11 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
 
       {/* ---- Totals ---- */}
       <section className="space-y-2 rounded-2xl bg-slate-900 p-4">
-        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">
-          Result ({shortA} — {shortB})
-        </h2>
+        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Result</h2>
 
         {totals.length > 0 && (
           <div className="rounded-xl bg-slate-950/60 p-3 text-center">
-            <p className="text-xl font-black">{decision}</p>
+            <p className="text-lg font-black">{decision}</p>
             {decisionNotes.length > 0 && (
               <p className="mt-0.5 text-[11px] uppercase tracking-wide text-slate-500">
                 {decisionNotes.join(' · ')}
@@ -527,20 +549,37 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         )}
 
         {totals.length === 0 && <p className="text-sm text-slate-500">No judges assigned yet.</p>}
-        {totals.map((t) => {
-          const lead = t.a > t.b ? shortA : t.b > t.a ? shortB : 'even';
-          return (
-            <div key={t.id} className="flex items-center justify-between text-sm">
-              <span className="text-slate-300">
-                <span className="font-black text-slate-500">{t.label}</span> {t.short}
-              </span>
-              <span className="font-bold tabular-nums">
-                {t.a} — {t.b}
-                <span className="ml-2 text-xs font-semibold uppercase text-emerald-300">{lead}</span>
-              </span>
-            </div>
-          );
-        })}
+        {totals.length > 0 && (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                <th className="py-1 text-left">Judge</th>
+                <th className="py-1 text-right text-red-400">{redName.split(' ')[0]}</th>
+                <th className="py-1 text-right text-sky-400">{blueName.split(' ')[0]}</th>
+                <th className="py-1 text-right">Lead</th>
+              </tr>
+            </thead>
+            <tbody>
+              {totals.map((t) => {
+                const red = redIsA ? t.a : t.b;
+                const blue = redIsA ? t.b : t.a;
+                const lead = red > blue ? 'Red' : blue > red ? 'Blue' : '=';
+                return (
+                  <tr key={t.id} className="border-t border-slate-800">
+                    <td className="py-1.5 text-left text-slate-300">
+                      <span className="font-black text-slate-500">{t.label}</span> {t.short}
+                    </td>
+                    <td className="py-1.5 text-right font-bold tabular-nums">{red}</td>
+                    <td className="py-1.5 text-right font-bold tabular-nums">{blue}</td>
+                    <td className="py-1.5 text-right text-xs font-semibold uppercase text-emerald-300">
+                      {lead}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </section>
 
       {fight.state !== 'completed' && fight.state !== 'cancelled' && (
