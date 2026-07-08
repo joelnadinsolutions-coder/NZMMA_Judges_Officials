@@ -75,7 +75,9 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
   const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
   const [judgeId, setJudgeId] = useState<string | null>(null);
-  const [round, setRound] = useState(fight.current_round);
+  // Always land on round 1; the judge moves forward themselves (auto-advance
+  // on save, or the round tabs). Later official round advances still follow.
+  const [round, setRound] = useState(1);
   const [selected, setSelected] = useState<ScoreOption | null>(null);
   const [tenSide, setTenSide] = useState<'red' | 'blue' | null>(null);
   const [confirmingEven, setConfirmingEven] = useState(false);
@@ -257,8 +259,14 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     [round, hasUnconfirmedPick, blockedTarget],
   );
 
-  // Follow the official when they advance the live round.
+  // Follow the official when they advance the live round, but never on first
+  // load: the card always lands on round 1 (skip the initial mount run).
+  const followedOnce = useRef(false);
   useEffect(() => {
+    if (!followedOnce.current) {
+      followedOnce.current = true;
+      return;
+    }
     if (fight.current_round === round) return;
     if (hasUnconfirmedPick()) {
       setBlockedTarget(fight.current_round);
