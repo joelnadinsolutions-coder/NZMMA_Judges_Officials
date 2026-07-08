@@ -4,7 +4,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { enqueueScore, pendingCount, registerAutoFlush } from '@/lib/offlineQueue';
-import { A_WINS, B_WINS, EVEN, type MarginTag, type ScoreOption } from '@/lib/scoring';
+import {
+  A_WINS,
+  B_WINS,
+  EVEN,
+  cornerToSide,
+  roundDeductionTotals,
+  type Corner,
+  type Deduction,
+  type RoundNote,
+  type ScoreOption,
+} from '@/lib/scoring';
 
 interface Fight {
   id: string;
@@ -21,7 +31,7 @@ interface Fight {
 
 type SubmitState = 'idle' | 'submitting' | 'saved' | 'pending' | 'error';
 type RoundState = 'pending' | 'live' | 'locked';
-type SavedScore = { a: number; b: number; note: string | null; tag: MarginTag | null };
+type SavedScore = { a: number; b: number; note: string | null; roundNote: RoundNote | null };
 type FinishMethod = 'ko' | 'tko' | 'submission' | 'dq' | 'other';
 type FinishFlag = { round_number: number; method: FinishMethod; note: string | null };
 
@@ -32,6 +42,9 @@ const FINISH_LABEL: Record<FinishMethod, string> = {
   dq: 'DQ',
   other: 'Other',
 };
+
+const ROUND_NOTES: RoundNote[] = ['decisive', 'moderate', 'close'];
+const UNDO_WINDOW_MS = 60_000;
 
 // Every option references a stable module constant, so we can identify the
 // current pick by reference (labels now collide across columns: A and B both
@@ -46,14 +59,17 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const [judgeId, setJudgeId] = useState<string | null>(null);
   const [round, setRound] = useState(fight.current_round);
   const [selected, setSelected] = useState<ScoreOption | null>(null);
+  const [confirmingEven, setConfirmingEven] = useState(false);
   const [note, setNote] = useState('');
-  const [marginTag, setMarginTag] = useState<MarginTag | null>(null);
+  const [roundNote, setRoundNote] = useState<RoundNote | null>(null);
   const [submit, setSubmit] = useState<SubmitState>('idle');
   const [queued, setQueued] = useState(0);
   const [online, setOnline] = useState(true);
+  const [nowTs, setNowTs] = useState(() => Date.now());
   const [roundStates, setRoundStates] = useState<Record<number, RoundState>>({});
-  const [deductions, setDeductions] = useState<Record<number, { a: number; b: number }>>({});
+  const [deductions, setDeductions] = useState<Deduction[]>([]);
   const [savedScores, setSavedScores] = useState<Record<number, SavedScore>>({});
+  const [sheetRound, setSheetRound] = useState<number | null>(null);
   const [finishFlag, setFinishFlag] = useState<FinishFlag | null>(null);
   const [flagging, setFlagging] = useState(false);
   const [flagMethod, setFlagMethod] = useState<FinishMethod>('tko');
@@ -67,18 +83,24 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   // Reflect a round's saved score (or a blank card) when you land on it.
   const applyRound = useCallback((r: number) => {
     const s = savedRef.current[r];
+    setConfirmingEven(false);
     if (s) {
       setSelected(optionFor(s.a, s.b));
       setNote(s.note ?? '');
-      setMarginTag(s.tag);
+      setRoundNote(s.roundNote);
       setSubmit('saved');
     } else {
       setSelected(null);
       setNote('');
-      setMarginTag(null);
+      setRoundNote(null);
       setSubmit('idle');
     }
   }, []);
+
+  const loadDeductions = useCallback(async () => {
+    const { data } = await supabase.from('deductions').select('*').eq('fight_id', fight.id);
+    setDeductions((data ?? []) as Deduction[]);
+  }, [supabase, fight.id]);
 
   useEffect(() => {
     supabase.auth.getUser().then(({ data }) => setJudgeId(data.user?.id ?? null));
@@ -88,7 +110,10 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     setOnline(navigator.onLine);
     window.addEventListener('online', on);
     window.addEventListener('offline', off);
-    const t = setInterval(async () => setQueued(await pendingCount()), 2000);
+    const t = setInterval(async () => {
+      setNowTs(Date.now());
+      setQueued(await pendingCount());
+    }, 1000);
     return () => {
       window.removeEventListener('online', on);
       window.removeEventListener('offline', off);
@@ -96,29 +121,29 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     };
   }, [supabase]);
 
-  // Load this judge's existing scores + each round's state, and follow round
-  // changes live (the official opening/locking rounds).
+  // Load this judge's existing scores, each round's state, and the fight's
+  // deductions, then follow changes live (the official opening/locking rounds,
+  // and anyone entering, confirming or voiding a deduction).
   useEffect(() => {
     if (!judgeId) return;
     let active = true;
 
     async function load() {
-      const [{ data: scoreRows }, { data: roundRows }, { data: flagRows }] = await Promise.all([
-        supabase
-          .from('scores')
-          .select('round_number, fighter_a_score, fighter_b_score, note, margin_tag')
-          .eq('fight_id', fight.id)
-          .eq('judge_id', judgeId),
-        supabase
-          .from('rounds')
-          .select('round_number, state, fighter_a_deduction, fighter_b_deduction')
-          .eq('fight_id', fight.id),
-        supabase
-          .from('judge_finish_flags')
-          .select('round_number, method, note')
-          .eq('fight_id', fight.id)
-          .eq('judge_id', judgeId),
-      ]);
+      const [{ data: scoreRows }, { data: roundRows }, { data: dedRows }, { data: flagRows }] =
+        await Promise.all([
+          supabase
+            .from('scores')
+            .select('round_number, fighter_a_score, fighter_b_score, note, round_note')
+            .eq('fight_id', fight.id)
+            .eq('judge_id', judgeId),
+          supabase.from('rounds').select('round_number, state').eq('fight_id', fight.id),
+          supabase.from('deductions').select('*').eq('fight_id', fight.id),
+          supabase
+            .from('judge_finish_flags')
+            .select('round_number, method, note')
+            .eq('fight_id', fight.id)
+            .eq('judge_id', judgeId),
+        ]);
       if (!active) return;
 
       setFinishFlag((flagRows?.[0] as FinishFlag | undefined) ?? null);
@@ -129,45 +154,39 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           a: r.fighter_a_score,
           b: r.fighter_b_score,
           note: r.note,
-          tag: (r.margin_tag as MarginTag | null) ?? null,
+          roundNote: (r.round_note as RoundNote | null) ?? null,
         };
       });
       savedRef.current = scores;
       setSavedScores(scores);
 
       const states: Record<number, RoundState> = {};
-      const deds: Record<number, { a: number; b: number }> = {};
       roundRows?.forEach((r) => {
         states[r.round_number] = r.state as RoundState;
-        deds[r.round_number] = { a: r.fighter_a_deduction ?? 0, b: r.fighter_b_deduction ?? 0 };
       });
       setRoundStates(states);
-      setDeductions(deds);
+      setDeductions((dedRows ?? []) as Deduction[]);
 
       applyRound(round);
     }
     load();
 
     const channel = supabase
-      .channel(`rounds-${fight.id}`)
+      .channel(`judge-${fight.id}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rounds', filter: `fight_id=eq.${fight.id}` },
         (payload) => {
-          const row = payload.new as {
-            round_number: number;
-            state: RoundState;
-            fighter_a_deduction?: number;
-            fighter_b_deduction?: number;
-          };
+          const row = payload.new as { round_number: number; state: RoundState };
           if (row?.round_number) {
             setRoundStates((prev) => ({ ...prev, [row.round_number]: row.state }));
-            setDeductions((prev) => ({
-              ...prev,
-              [row.round_number]: { a: row.fighter_a_deduction ?? 0, b: row.fighter_b_deduction ?? 0 },
-            }));
           }
         },
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'deductions', filter: `fight_id=eq.${fight.id}` },
+        () => loadDeductions(),
       )
       .subscribe();
 
@@ -178,7 +197,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     // applyRound/round intentionally excluded: this effect owns loading + the
     // subscription; round changes are handled by the effect below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [supabase, judgeId, fight.id]);
+  }, [supabase, judgeId, fight.id, loadDeductions]);
 
   // Show the saved score (or blank) whenever you switch rounds.
   useEffect(() => {
@@ -243,11 +262,37 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const roundState: RoundState = roundStates[round] ?? 'pending';
   const roundLive = roundState === 'live';
   const roundLocked = roundState === 'locked';
+  const boutOver = fight.state === 'completed' || fight.state === 'cancelled';
 
   // Can only pick/edit a score on a live round that has not been submitted
   // yet, and not after this judge has marked the fight finished.
   const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved' || !!finishFlag;
   const confirmDisabled = pickDisabled || !selected || !judgeId;
+
+  // Picking a winner clears any in-flight 10-10 confirmation.
+  const pickOption = useCallback((o: ScoreOption) => {
+    setConfirmingEven(false);
+    setSelected(o);
+  }, []);
+
+  // 10-10 is exceptional: require a deliberate confirmation tap before it is
+  // accepted as the pick.
+  const chooseEven = useCallback(() => {
+    if (pickDisabled) return;
+    if (selected?.winner === 'even') return;
+    setConfirmingEven(true);
+  }, [pickDisabled, selected]);
+
+  const voidDeduction = useCallback(
+    async (id: string) => {
+      const { error } = await supabase.rpc('set_deduction_status', {
+        d_id: id,
+        new_status: 'voided',
+      });
+      if (!error) await loadDeductions();
+    },
+    [supabase, loadDeductions],
+  );
 
   // The judge's own finish observation. Closes THEIR card only: the official
   // still closes the bout, and the official's result always overrules this.
@@ -302,12 +347,12 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         fighter_a_score: selected.a,
         fighter_b_score: selected.b,
         note: trimmed || null,
-        margin_tag: marginTag,
+        round_note: roundNote,
       });
       // Remember locally so revisiting this round shows the score.
       savedRef.current = {
         ...savedRef.current,
-        [round]: { a: selected.a, b: selected.b, note: trimmed || null, tag: marginTag },
+        [round]: { a: selected.a, b: selected.b, note: trimmed || null, roundNote },
       };
       setSavedScores(savedRef.current);
       setSubmit(reachedServer ? 'saved' : 'pending');
@@ -317,24 +362,36 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     } catch {
       setSubmit('error');
     }
-  }, [confirmDisabled, selected, judgeId, fight.id, round, note, marginTag]);
+  }, [confirmDisabled, selected, judgeId, fight.id, round, note, roundNote]);
 
   const roundOptions = useMemo(
     () => Array.from({ length: fight.scheduled_rounds }, (_, i) => i + 1),
     [fight.scheduled_rounds],
   );
 
-  // Running scorecard: base 10-point-must scores minus referee deductions.
+  // Running scorecard: base 10-point-must scores minus non-voided deductions
+  // (deductions apply to every judge uniformly).
   const tally = useMemo(() => {
     let a = 0;
     let b = 0;
     for (const [rnum, s] of Object.entries(savedScores)) {
-      const d = deductions[Number(rnum)] ?? { a: 0, b: 0 };
+      const d = roundDeductionTotals(deductions, Number(rnum), fight);
       a += s.a - d.a;
       b += s.b - d.b;
     }
     return { a, b };
-  }, [savedScores, deductions]);
+  }, [savedScores, deductions, fight]);
+
+  const sortedDeductions = useMemo(
+    () =>
+      deductions
+        .slice()
+        .sort(
+          (x, y) =>
+            x.round_number - y.round_number || x.created_at.localeCompare(y.created_at),
+        ),
+    [deductions],
+  );
 
   const hasScores = Object.keys(savedScores).length > 0;
   const shortA = fight.fighter_a_name.split(' ')[0];
@@ -407,6 +464,51 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         )}
       </div>
 
+      {/* ---- Deductions (shown on every judge's card) ---- */}
+      {sortedDeductions.length > 0 && (
+        <div className="mx-4 mb-2 space-y-1 rounded-lg bg-slate-900/70 px-3 py-2 ring-1 ring-slate-800">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">Deductions</p>
+          {sortedDeductions.map((d) => {
+            const own = d.entered_by === judgeId;
+            const remainingMs = UNDO_WINDOW_MS - (nowTs - Date.parse(d.created_at));
+            const canUndo = own && d.status === 'pending' && remainingMs > 0;
+            const undoExpired = own && d.status === 'pending' && remainingMs <= 0;
+            return (
+              <div key={d.id} className="flex items-center justify-between gap-2 text-xs">
+                <span
+                  className={
+                    d.status === 'voided' ? 'text-slate-600 line-through' : 'font-semibold text-red-300'
+                  }
+                >
+                  -{d.points} {d.corner.toUpperCase()}, Rd {d.round_number}
+                  {d.reason ? ` (${d.reason})` : ''}{' '}
+                  <span className="font-normal text-slate-500">
+                    {d.status === 'pending'
+                      ? '(pending confirmation)'
+                      : d.status === 'confirmed'
+                      ? '(confirmed)'
+                      : '(voided)'}
+                  </span>
+                </span>
+                {canUndo && (
+                  <button
+                    onClick={() => voidDeduction(d.id)}
+                    className="shrink-0 rounded-md bg-amber-500/20 px-2 py-1 text-[11px] font-bold text-amber-200"
+                  >
+                    Undo {Math.ceil(remainingMs / 1000)}s
+                  </button>
+                )}
+                {undoExpired && (
+                  <span className="shrink-0 text-[10px] text-slate-500">
+                    contact head official to amend
+                  </span>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
       {/* ---- Bout-complete banner ---- */}
       {fight.state === 'completed' && (
         <div className="mx-4 mb-2 space-y-2">
@@ -445,7 +547,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       )}
 
       {/* ---- Round status banner ---- */}
-      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && !finishFlag && (
+      {!boutOver && !roundLive && !finishFlag && (
         <p className="mx-4 mb-2 rounded-lg bg-slate-800/60 px-3 py-2 text-center text-xs font-semibold text-slate-300">
           {roundLocked
             ? 'Round locked. Scores are final.'
@@ -454,7 +556,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       )}
 
       {/* ---- Judge finish flag: closes this judge's card only ---- */}
-      {fight.state !== 'completed' && fight.state !== 'cancelled' && (
+      {!boutOver && (
         <div className="mx-4 mb-2">
           {finishFlag ? (
             <div className="space-y-2 rounded-lg bg-amber-500/10 px-3 py-2 ring-1 ring-amber-500/30">
@@ -531,21 +633,47 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           ringClass={cornerClass(fight.fighter_a_corner)}
           options={A_WINS}
           selected={selected}
-          onPick={setSelected}
+          onPick={pickOption}
           disabled={pickDisabled}
         />
 
-        <button
-          onClick={() => setSelected(EVEN)}
-          disabled={pickDisabled}
-          className={`h-14 rounded-xl border-2 text-lg font-bold transition disabled:opacity-40 ${
-            selected?.winner === 'even'
-              ? 'border-slate-50 bg-slate-50 text-slate-950'
-              : 'border-slate-700 text-slate-300'
-          }`}
-        >
-          EVEN ROUND · 10-10
-        </button>
+        <div>
+          <button
+            onClick={chooseEven}
+            disabled={pickDisabled}
+            className={`h-14 w-full rounded-xl border-2 text-lg font-bold transition disabled:opacity-40 ${
+              selected?.winner === 'even'
+                ? 'border-slate-50 bg-slate-50 text-slate-950'
+                : 'border-slate-700 text-slate-300'
+            }`}
+          >
+            EVEN ROUND · 10-10
+          </button>
+          {confirmingEven && (
+            <div className="mt-2 space-y-2 rounded-xl bg-slate-900 p-3 ring-1 ring-amber-500/40">
+              <p className="text-center text-xs font-semibold text-amber-300">
+                10-10 is exceptional. Confirm this is an even round?
+              </p>
+              <div className="flex gap-2">
+                <button
+                  onClick={() => {
+                    setSelected(EVEN);
+                    setConfirmingEven(false);
+                  }}
+                  className="h-10 flex-1 rounded-lg bg-amber-500 text-xs font-bold text-slate-950"
+                >
+                  Confirm 10-10
+                </button>
+                <button
+                  onClick={() => setConfirmingEven(false)}
+                  className="h-10 rounded-lg bg-slate-800 px-4 text-xs font-bold text-slate-300"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
 
         <FighterColumn
           name={fight.fighter_b_name}
@@ -553,34 +681,41 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           ringClass={cornerClass(fight.fighter_b_corner)}
           options={B_WINS}
           selected={selected}
-          onPick={setSelected}
+          onPick={pickOption}
           disabled={pickDisabled}
         />
 
-        {/* ---- Optional tags + note (beside the score) ---- */}
+        {/* ---- Optional round note + free-text note ---- */}
         <div className="flex items-stretch gap-2">
           <div className="flex flex-col gap-2">
-            <TagChip
-              label="Close"
-              active={marginTag === 'close'}
-              disabled={pickDisabled}
-              onClick={() => setMarginTag((t) => (t === 'close' ? null : 'close'))}
-            />
-            <TagChip
-              label="Decisive"
-              active={marginTag === 'decisive'}
-              disabled={pickDisabled}
-              onClick={() => setMarginTag((t) => (t === 'decisive' ? null : 'decisive'))}
-            />
+            {ROUND_NOTES.map((rn) => (
+              <TagChip
+                key={rn}
+                label={rn[0].toUpperCase() + rn.slice(1)}
+                active={roundNote === rn}
+                disabled={pickDisabled}
+                onClick={() => setRoundNote((t) => (t === rn ? null : rn))}
+              />
+            ))}
           </div>
           <textarea
             value={note}
             onChange={(e) => setNote(e.target.value)}
             disabled={pickDisabled}
             placeholder="Note (optional): foul, knockdown, etc."
-            className="min-h-[5.5rem] flex-1 resize-none rounded-xl bg-slate-900 p-3 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600 disabled:opacity-50"
+            className="min-h-[8rem] flex-1 resize-none rounded-xl bg-slate-900 p-3 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600 disabled:opacity-50"
           />
         </div>
+
+        {/* ---- Point deduction (per round) ---- */}
+        {!boutOver && !finishFlag && (
+          <button
+            onClick={() => setSheetRound(round)}
+            className="h-12 rounded-xl bg-slate-900 text-sm font-bold text-red-300 ring-1 ring-red-500/30"
+          >
+            Point deduction (Rd {round})
+          </button>
+        )}
       </main>
 
       {/* ---- Confirm ---- */}
@@ -628,6 +763,17 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
             : 'CONFIRM SCORE'}
         </button>
       </footer>
+
+      {sheetRound !== null && judgeId && (
+        <DeductionSheet
+          fight={fight}
+          round={sheetRound}
+          judgeId={judgeId}
+          deductions={deductions}
+          onClose={() => setSheetRound(null)}
+          onSaved={loadDeductions}
+        />
+      )}
     </div>
   );
 }
@@ -706,5 +852,162 @@ function TagChip({
     >
       {label}
     </button>
+  );
+}
+
+// Judge-side deduction entry. Lists any EXISTING deductions for the bout first
+// (a duplicate guard), then takes corner + points + optional reason. The insert
+// goes straight to Supabase; the 60s undo lives on the card line item.
+function DeductionSheet({
+  fight,
+  round,
+  judgeId,
+  deductions,
+  onClose,
+  onSaved,
+}: {
+  fight: Fight;
+  round: number;
+  judgeId: string;
+  deductions: Deduction[];
+  onClose: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const supabase = getSupabase();
+  const [corner, setCorner] = useState<Corner>(
+    fight.fighter_a_corner === 'blue' && fight.fighter_b_corner === 'red' ? 'blue' : 'red',
+  );
+  const [points, setPoints] = useState(1);
+  const [reason, setReason] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const existing = deductions
+    .slice()
+    .sort((a, b) => a.round_number - b.round_number || a.created_at.localeCompare(b.created_at));
+
+  const nameForCorner = (c: Corner) => {
+    const side = cornerToSide(fight, c);
+    return side === 'a' ? fight.fighter_a_name : side === 'b' ? fight.fighter_b_name : c;
+  };
+
+  async function submit() {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    const { error: insErr } = await supabase.from('deductions').insert({
+      fight_id: fight.id,
+      round_number: round,
+      corner,
+      points,
+      reason: reason.trim() || null,
+      entered_by: judgeId,
+    });
+    if (insErr) {
+      setError(insErr.message);
+      setBusy(false);
+      return;
+    }
+    await onSaved();
+    setBusy(false);
+    onClose();
+  }
+
+  return (
+    <div className="fixed inset-0 z-20 flex items-end bg-black/60" onClick={onClose}>
+      <div
+        className="max-h-[90dvh] w-full space-y-4 overflow-y-auto rounded-t-3xl bg-slate-950 p-4 pb-[max(env(safe-area-inset-bottom),1.5rem)] ring-1 ring-slate-800"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between">
+          <h2 className="text-lg font-black">Point deduction · Rd {round}</h2>
+          <button onClick={onClose} className="text-sm font-semibold text-slate-400">
+            Close
+          </button>
+        </div>
+
+        {/* Existing deductions first, to prevent duplicates. */}
+        <div className="space-y-1 rounded-xl bg-slate-900 p-3 ring-1 ring-slate-800">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
+            Existing deductions on this bout
+          </p>
+          {existing.length === 0 ? (
+            <p className="text-xs text-slate-500">None yet.</p>
+          ) : (
+            existing.map((d) => (
+              <p
+                key={d.id}
+                className={`text-xs ${
+                  d.status === 'voided' ? 'text-slate-600 line-through' : 'text-slate-300'
+                }`}
+              >
+                -{d.points} {d.corner.toUpperCase()}, Rd {d.round_number}
+                {d.reason ? ` (${d.reason})` : ''} · {d.status}
+              </p>
+            ))
+          )}
+        </div>
+
+        <div>
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Corner</p>
+          <div className="flex gap-2">
+            {(['red', 'blue'] as Corner[]).map((c) => (
+              <button
+                key={c}
+                onClick={() => setCorner(c)}
+                className={`h-12 flex-1 rounded-xl text-sm font-bold uppercase transition ${
+                  corner === c
+                    ? c === 'red'
+                      ? 'bg-red-500 text-white'
+                      : 'bg-sky-500 text-white'
+                    : 'bg-slate-800 text-slate-300'
+                }`}
+              >
+                {c} · {nameForCorner(c).split(' ')[0]}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">Points</p>
+          <div className="flex items-center justify-between rounded-xl bg-slate-900 p-2">
+            <button
+              onClick={() => setPoints((p) => Math.max(1, p - 1))}
+              className="h-11 w-11 rounded-lg bg-slate-700 text-xl font-black"
+            >
+              −
+            </button>
+            <span className="text-2xl font-black tabular-nums">-{points}</span>
+            <button
+              onClick={() => setPoints((p) => Math.min(3, p + 1))}
+              className="h-11 w-11 rounded-lg bg-slate-700 text-xl font-black"
+            >
+              +
+            </button>
+          </div>
+        </div>
+
+        <input
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="Reason (optional): low blow, holding fence, etc."
+          className="h-12 w-full rounded-xl bg-slate-900 px-3 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600"
+        />
+
+        {error && <p className="text-sm text-red-400">{error}</p>}
+
+        <button
+          onClick={submit}
+          disabled={busy}
+          className="h-14 w-full rounded-2xl bg-red-500 text-lg font-black text-white disabled:opacity-40"
+        >
+          {busy ? 'Saving…' : `Enter -${points} ${corner.toUpperCase()}`}
+        </button>
+        <p className="text-center text-[11px] text-slate-500">
+          You can undo this within 60 seconds. After that, the head official must amend it.
+        </p>
+      </div>
+    </div>
   );
 }
