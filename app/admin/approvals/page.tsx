@@ -10,6 +10,7 @@ type Status = 'pending' | 'approved' | 'suspended';
 interface Profile {
   id: string;
   full_name: string;
+  email: string | null;
   role: Role;
   status: Status;
   region: string | null;
@@ -24,7 +25,7 @@ export default function ApprovalsPage() {
   const load = useCallback(async () => {
     const { data } = await supabase
       .from('profiles')
-      .select('id, full_name, role, status, region')
+      .select('id, full_name, email, role, status, region')
       .order('created_at', { ascending: false });
     setProfiles((data ?? []) as Profile[]);
   }, [supabase]);
@@ -104,6 +105,9 @@ function ProfileRow({
         />
         <StatusBadge status={profile.status} />
       </div>
+      {profile.email && (
+        <p className="-mt-1 truncate text-xs text-slate-500">{profile.email}</p>
+      )}
       {nameDirty && (
         <button
           onClick={() => onPatch(profile.id, { full_name: name.trim() })}

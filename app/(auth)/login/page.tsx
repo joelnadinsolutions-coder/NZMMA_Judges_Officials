@@ -19,6 +19,8 @@ export default function LoginPage() {
   const [mode, setMode] = useState<Mode>('signin');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [firstName, setFirstName] = useState('');
+  const [lastName, setLastName] = useState('');
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -123,12 +125,21 @@ export default function LoginPage() {
 
   async function signUpWithPassword() {
     resetMessages();
+    if (!firstName.trim() || !lastName.trim()) {
+      setErr('Please enter your first and last name.');
+      return;
+    }
     if (password.length < 8) {
       setErr('Password must be at least 8 characters.');
       return;
     }
     setBusy(true);
-    const { data, error } = await supabase.auth.signUp({ email, password });
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      // Passed to the handle_new_user trigger, which composes full_name.
+      options: { data: { first_name: firstName.trim(), last_name: lastName.trim() } },
+    });
     setBusy(false);
     if (error) {
       setErr(error.message);
@@ -286,6 +297,27 @@ export default function LoginPage() {
           </div>
         ) : (
           <>
+            {mode === 'signup' && (
+              <div className="flex gap-2">
+                <input
+                  type="text"
+                  autoComplete="given-name"
+                  placeholder="First name"
+                  value={firstName}
+                  onChange={(e) => setFirstName(e.target.value)}
+                  className={inputCls}
+                />
+                <input
+                  type="text"
+                  autoComplete="family-name"
+                  placeholder="Last name"
+                  value={lastName}
+                  onChange={(e) => setLastName(e.target.value)}
+                  className={inputCls}
+                />
+              </div>
+            )}
+
             <input
               type="email"
               inputMode="email"
@@ -320,7 +352,7 @@ export default function LoginPage() {
             {mode === 'signup' && (
               <button
                 onClick={signUpWithPassword}
-                disabled={!email || !password || busy}
+                disabled={!email || !password || !firstName.trim() || !lastName.trim() || busy}
                 className={primaryBtnCls}
               >
                 {busy ? 'Creating…' : 'Create account'}
