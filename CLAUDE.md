@@ -41,7 +41,8 @@ changes.
 Schema and policies live in `supabase/` and are applied by hand in the
 Supabase SQL editor: `schema.sql` first, then the idempotent migrations
 `phase2.sql`, `phase2b_margin_tag.sql`, `phase3_fight_lifecycle.sql`,
-`phase4_event_archive.sql`, `phase5_judge_finish_flags.sql`.
+`phase4_event_archive.sql`, `phase5_judge_finish_flags.sql`,
+`phase6_deductions.sql`, `phase7_round_note_and_signup.sql`.
 `seed_test_panel.sql` is a manual dev fixture only.
 
 Rules that must not be weakened:
@@ -51,8 +52,14 @@ Rules that must not be weakened:
   `round_is_live()`), never trusted from the client.
 - Scores are append-only: no DELETE policies, immutability trigger after
   lock, `score_audit` records every change.
+- Deductions are a central record (`deductions`): entered by an assigned
+  judge or an official, immutable core fields, status only moves
+  pending -> confirmed | voided through the `set_deduction_status` RPC
+  (author may void within 60s; officials any time), every change logged to
+  `deduction_audit`. No UPDATE/DELETE policy on the table.
 - New signups become `role=judge, status=pending` via the
-  `on_auth_user_created` trigger and are approved at `/admin/approvals`.
+  `on_auth_user_created` trigger, with first/last name from
+  `signUp` `options.data`, and are approved at `/admin/approvals`.
 
 ## House rules
 

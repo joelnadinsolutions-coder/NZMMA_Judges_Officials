@@ -58,13 +58,17 @@ Key design choices:
 - **Composite FK** ties every score to a real round of that fight.
 - **`fights.state`** (`scheduled` → `in_progress` → `completed`/`cancelled`) tracks the bout's lifecycle, separately from `rounds.state`. Opening round 1 flips `scheduled` → `in_progress`; the `complete_fight()` RPC closes the bout out.
 
-See `supabase/schema.sql` for the base DDL, RLS policies, triggers, and `lock_round()`. Three additive migrations layer on top (all idempotent, run once each in the SQL editor):
+See `supabase/schema.sql` for the base DDL, RLS policies, triggers, and `lock_round()`. Additive migrations layer on top (all idempotent, run once each in the SQL editor):
 
 | Migration | Adds |
 |---|---|
-| `supabase/phase2.sql` | Per-round point deductions (`fighter_a_deduction`/`_b`, `deduction_note`); bout format (`round_minutes`, `is_championship`). |
-| `supabase/phase2b_margin_tag.sql` | `scores.margin_tag` (`close`/`decisive`) — a judge's optional round-margin annotation. |
+| `supabase/phase2.sql` | Per-round point deductions (`fighter_a_deduction`/`_b`, `deduction_note`); bout format (`round_minutes`, `is_championship`). Deduction columns superseded by phase6 (left dormant). |
+| `supabase/phase2b_margin_tag.sql` | `scores.margin_tag` (`close`/`decisive`) — superseded by phase7's `round_note` (left dormant). |
 | `supabase/phase3_fight_lifecycle.sql` | `fights.result_method`/`result_winner`/`result_round`/`result_note`/`completed_at`, a DB check that `state = 'completed'` requires a recorded method, and the `complete_fight()` RPC (official-only; bulk-locks every remaining round and stamps the result atomically). |
+| `supabase/phase4_event_archive.sql` | `events.archived_at` — archived events keep their data but drop out of the main list. |
+| `supabase/phase5_judge_finish_flags.sql` | `judge_finish_flags` — a judge's own early-finish observation (informational; the official's result is authoritative). |
+| `supabase/phase6_deductions.sql` | Central `deductions` record (corner/points/status, entered by an assigned judge or official) + `deduction_audit`, the `set_deduction_status` RPC (pending -> confirmed \| voided; author void within 60s, officials any time), a guard trigger keeping core fields immutable, RLS, and Realtime. Replaces the phase2 per-round deduction columns. |
+| `supabase/phase7_round_note_and_signup.sql` | `scores.round_note` (optional `decisive`/`moderate`/`close`, backfilled from `margin_tag`); `profiles.first_name`/`last_name`/`email`; `handle_new_user` composes `full_name` from the names passed via `signUp` `options.data`. |
 
 `supabase/seed_test_panel.sql` is a manual dev fixture (adds two extra judges + scores to a named test bout) — not part of the deployed schema.
 
