@@ -16,9 +16,15 @@ do $$ begin
     check (round_note is null or round_note in ('decisive', 'moderate', 'close'));
 exception when duplicate_object then null; end $$;
 
+-- Backfill from the old margin_tag. Some scores are locked, and the
+-- immutability trigger (trg_lock_scores) blocks edits to a locked row, so
+-- disable it for this one controlled migration update, exactly as
+-- lock_round() and complete_fight() do for their bulk locks.
+alter table public.scores disable trigger trg_lock_scores;
 update public.scores
    set round_note = margin_tag
  where round_note is null and margin_tag is not null;
+alter table public.scores enable trigger trg_lock_scores;
 
 
 -- ---------- Real names + email on profiles ----------
