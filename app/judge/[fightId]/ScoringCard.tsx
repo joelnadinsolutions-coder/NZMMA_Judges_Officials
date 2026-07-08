@@ -54,11 +54,30 @@ function optionFor(a: number, b: number): ScoreOption | null {
   return ALL_OPTIONS.find((o) => o.a === a && o.b === b) ?? null;
 }
 
+// Break a stored score back into "which corner got the 10" + "the other
+// corner's score", to drive the two-step picker. Even (10-10) is shown as
+// the red button active with the other side on 10.
+function tenFromOption(
+  sel: ScoreOption | null,
+  redIsA: boolean,
+): { side: 'red' | 'blue' | null; other: number | null } {
+  if (!sel) return { side: null, other: null };
+  const red = redIsA ? sel.a : sel.b;
+  const blue = redIsA ? sel.b : sel.a;
+  if (sel.winner === 'even') return { side: 'red', other: 10 };
+  if (red === 10 && blue < 10) return { side: 'red', other: blue };
+  return { side: 'blue', other: red };
+}
+
 export default function ScoringCard({ fight }: { fight: Fight }) {
   const supabase = getSupabase();
+  const redIsA = fight.fighter_a_corner === 'red';
+  const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
+  const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
   const [judgeId, setJudgeId] = useState<string | null>(null);
   const [round, setRound] = useState(fight.current_round);
   const [selected, setSelected] = useState<ScoreOption | null>(null);
+  const [tenSide, setTenSide] = useState<'red' | 'blue' | null>(null);
   const [confirmingEven, setConfirmingEven] = useState(false);
   const [note, setNote] = useState('');
   const [roundNote, setRoundNote] = useState<RoundNote | null>(null);
@@ -81,21 +100,27 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const savedRef = useRef<Record<number, SavedScore>>({});
 
   // Reflect a round's saved score (or a blank card) when you land on it.
-  const applyRound = useCallback((r: number) => {
-    const s = savedRef.current[r];
-    setConfirmingEven(false);
-    if (s) {
-      setSelected(optionFor(s.a, s.b));
-      setNote(s.note ?? '');
-      setRoundNote(s.roundNote);
-      setSubmit('saved');
-    } else {
-      setSelected(null);
-      setNote('');
-      setRoundNote(null);
-      setSubmit('idle');
-    }
-  }, []);
+  const applyRound = useCallback(
+    (r: number) => {
+      const s = savedRef.current[r];
+      setConfirmingEven(false);
+      if (s) {
+        const opt = optionFor(s.a, s.b);
+        setSelected(opt);
+        setTenSide(tenFromOption(opt, redIsA).side);
+        setNote(s.note ?? '');
+        setRoundNote(s.roundNote);
+        setSubmit('saved');
+      } else {
+        setSelected(null);
+        setTenSide(null);
+        setNote('');
+        setRoundNote(null);
+        setSubmit('idle');
+      }
+    },
+    [redIsA],
+  );
 
   const loadDeductions = useCallback(async () => {
     const { data } = await supabase.from('deductions').select('*').eq('fight_id', fight.id);
@@ -256,32 +281,66 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     }
   }, [blockedTarget, hasUnconfirmedPick]);
 
-  const cornerClass = (corner: string) =>
-    corner === 'red' ? 'ring-red-500/70' : corner === 'blue' ? 'ring-sky-500/70' : 'ring-slate-500/70';
-
   const roundState: RoundState = roundStates[round] ?? 'pending';
   const roundLive = roundState === 'live';
   const roundLocked = roundState === 'locked';
   const boutOver = fight.state === 'completed' || fight.state === 'cancelled';
 
+  // Rounds must be scored in order: block this round if an earlier open round
+  // has not been scored yet, so a judge cannot skip ahead by mistake.
+  let firstUnscoredEarlier: number | null = null;
+  for (let r = 1; r < round; r++) {
+    if ((roundStates[r] ?? 'pending') === 'live' && !savedScores[r]) {
+      firstUnscoredEarlier = r;
+      break;
+    }
+  }
+  const outOfOrder = firstUnscoredEarlier !== null;
+
   // Can only pick/edit a score on a live round that has not been submitted
-  // yet, and not after this judge has marked the fight finished.
-  const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved' || !!finishFlag;
+  // yet, not out of order, and not after this judge has marked the fight
+  // finished.
+  const pickDisabled =
+    !roundLive || outOfOrder || submit === 'submitting' || submit === 'saved' || !!finishFlag;
   const confirmDisabled = pickDisabled || !selected || !judgeId;
 
-  // Picking a winner clears any in-flight 10-10 confirmation.
-  const pickOption = useCallback((o: ScoreOption) => {
-    setConfirmingEven(false);
-    setSelected(o);
-  }, []);
+  // Current picker state, derived from the stored option.
+  const otherScoreSel = selected ? tenFromOption(selected, redIsA).other : confirmingEven ? 10 : null;
 
-  // 10-10 is exceptional: require a deliberate confirmation tap before it is
-  // accepted as the pick.
-  const chooseEven = useCallback(() => {
-    if (pickDisabled) return;
-    if (selected?.winner === 'even') return;
-    setConfirmingEven(true);
-  }, [pickDisabled, selected]);
+  // Step 1: choose which corner gets the 10.
+  const selectTen = useCallback(
+    (side: 'red' | 'blue') => {
+      if (pickDisabled) return;
+      setConfirmingEven(false);
+      setTenSide(side);
+      setSelected(null);
+    },
+    [pickDisabled],
+  );
+
+  // Step 2: choose the other corner's score (10 = even, needs confirming).
+  const selectOther = useCallback(
+    (v: number) => {
+      if (pickDisabled || !tenSide) return;
+      if (v === 10) {
+        setSelected(null);
+        setConfirmingEven(true);
+        return;
+      }
+      setConfirmingEven(false);
+      const red = tenSide === 'red' ? 10 : v;
+      const blue = tenSide === 'blue' ? 10 : v;
+      const a = redIsA ? red : blue;
+      const b = redIsA ? blue : red;
+      setSelected(optionFor(a, b));
+    },
+    [pickDisabled, tenSide, redIsA],
+  );
+
+  const confirmEven = useCallback(() => {
+    setSelected(EVEN);
+    setConfirmingEven(false);
+  }, []);
 
   const voidDeduction = useCallback(
     async (id: string) => {
@@ -385,9 +444,6 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   }${fight.is_championship ? ' · title' : ''}`;
 
   // Paper-style scorecard rows, keyed to Red / Blue corners (not fighter A/B).
-  const redIsA = fight.fighter_a_corner === 'red';
-  const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
-  const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
   const scoreRows = roundOptions.map((r) => {
     const s = savedScores[r];
     const d = roundDeductionTotals(deductions, r, fight);
@@ -633,6 +689,21 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         </p>
       )}
 
+      {/* ---- Score-in-order hold ---- */}
+      {!boutOver && roundLive && outOfOrder && !finishFlag && firstUnscoredEarlier !== null && (
+        <div className="mx-4 mb-2 space-y-2 rounded-lg bg-amber-500/10 px-3 py-2 text-center ring-1 ring-amber-500/30">
+          <p className="text-xs font-semibold text-amber-300">
+            Score rounds in order. Round {firstUnscoredEarlier} is not scored yet.
+          </p>
+          <button
+            onClick={() => requestRound(firstUnscoredEarlier as number)}
+            className="mx-auto block rounded-lg bg-amber-500 px-4 py-1.5 text-xs font-bold text-slate-950"
+          >
+            Go to round {firstUnscoredEarlier}
+          </button>
+        </div>
+      )}
+
       {/* ---- Judge finish flag: closes this judge's card only ---- */}
       {!boutOver && (
         <div className="mx-4 mb-2">
@@ -703,65 +774,87 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         </div>
       )}
 
-      {/* ---- Fighter columns ---- */}
+      {/* ---- Scoring: pick who gets the 10, then the other side's score ---- */}
       <main className="flex flex-1 flex-col gap-3 px-4">
-        <FighterColumn
-          name={fight.fighter_a_name}
-          corner={fight.fighter_a_corner}
-          ringClass={cornerClass(fight.fighter_a_corner)}
-          options={A_WINS}
-          selected={selected}
-          onPick={pickOption}
-          disabled={pickDisabled}
-        />
-
         <div>
-          <button
-            onClick={chooseEven}
-            disabled={pickDisabled}
-            className={`h-12 w-full rounded-xl border-2 text-base font-bold transition disabled:opacity-40 ${
-              selected?.winner === 'even'
-                ? 'border-slate-50 bg-slate-50 text-slate-950'
-                : 'border-slate-700 text-slate-300'
-            }`}
-          >
-            EVEN ROUND · 10-10
-          </button>
-          {confirmingEven && (
-            <div className="mt-2 space-y-2 rounded-xl bg-slate-900 p-3 ring-1 ring-amber-500/40">
-              <p className="text-center text-xs font-semibold text-amber-300">
-                10-10 is exceptional. Confirm this is an even round?
-              </p>
-              <div className="flex gap-2">
-                <button
-                  onClick={() => {
-                    setSelected(EVEN);
-                    setConfirmingEven(false);
-                  }}
-                  className="h-10 flex-1 rounded-lg bg-amber-500 text-xs font-bold text-slate-950"
-                >
-                  Confirm 10-10
-                </button>
-                <button
-                  onClick={() => setConfirmingEven(false)}
-                  className="h-10 rounded-lg bg-slate-800 px-4 text-xs font-bold text-slate-300"
-                >
-                  Back
-                </button>
-              </div>
-            </div>
-          )}
+          <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">
+            Winner (gets 10)
+          </p>
+          <div className="grid grid-cols-2 gap-2">
+            <button
+              onClick={() => selectTen('red')}
+              disabled={pickDisabled}
+              className={`h-16 rounded-2xl text-lg font-black ring-2 transition disabled:opacity-40 ${
+                tenSide === 'red'
+                  ? 'bg-red-500 text-white ring-red-400'
+                  : 'bg-slate-900 text-slate-100 ring-red-500/40'
+              }`}
+            >
+              <span className="block text-[10px] font-bold uppercase tracking-widest opacity-80">
+                Red · 10
+              </span>
+              {redName.split(' ')[0]}
+            </button>
+            <button
+              onClick={() => selectTen('blue')}
+              disabled={pickDisabled}
+              className={`h-16 rounded-2xl text-lg font-black ring-2 transition disabled:opacity-40 ${
+                tenSide === 'blue'
+                  ? 'bg-sky-500 text-white ring-sky-400'
+                  : 'bg-slate-900 text-slate-100 ring-sky-500/40'
+              }`}
+            >
+              <span className="block text-[10px] font-bold uppercase tracking-widest opacity-80">
+                Blue · 10
+              </span>
+              {blueName.split(' ')[0]}
+            </button>
+          </div>
         </div>
 
-        <FighterColumn
-          name={fight.fighter_b_name}
-          corner={fight.fighter_b_corner}
-          ringClass={cornerClass(fight.fighter_b_corner)}
-          options={B_WINS}
-          selected={selected}
-          onPick={pickOption}
-          disabled={pickDisabled}
-        />
+        {tenSide && (
+          <div className="rounded-2xl bg-slate-900 p-3 ring-1 ring-slate-800">
+            <p className="mb-2 text-center text-xs font-bold uppercase tracking-widest text-slate-400">
+              {(tenSide === 'red' ? blueName : redName).split(' ')[0]} score
+            </p>
+            <div className="grid grid-cols-4 gap-2">
+              {[10, 9, 8, 7].map((v) => (
+                <button
+                  key={v}
+                  onClick={() => selectOther(v)}
+                  disabled={pickDisabled}
+                  className={`h-16 rounded-xl text-2xl font-black tabular-nums transition disabled:opacity-40 ${
+                    otherScoreSel === v ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-100'
+                  }`}
+                >
+                  {v}
+                </button>
+              ))}
+            </div>
+            <p className="mt-1 text-center text-[10px] text-slate-500">10 = even round (10-10)</p>
+            {confirmingEven && (
+              <div className="mt-2 space-y-2 rounded-xl bg-slate-950 p-3 ring-1 ring-amber-500/40">
+                <p className="text-center text-xs font-semibold text-amber-300">
+                  10-10 is exceptional. Confirm this is an even round?
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={confirmEven}
+                    className="h-10 flex-1 rounded-lg bg-amber-500 text-xs font-bold text-slate-950"
+                  >
+                    Confirm 10-10
+                  </button>
+                  <button
+                    onClick={() => setConfirmingEven(false)}
+                    className="h-10 rounded-lg bg-slate-800 px-4 text-xs font-bold text-slate-300"
+                  >
+                    Back
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
 
         {/* ---- Optional round note + free-text note ---- */}
         <div className="flex items-stretch gap-2">
@@ -853,57 +946,6 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         />
       )}
     </div>
-  );
-}
-
-function FighterColumn({
-  name,
-  corner,
-  ringClass,
-  options,
-  selected,
-  onPick,
-  disabled,
-}: {
-  name: string;
-  corner: string;
-  ringClass: string;
-  options: ScoreOption[];
-  selected: ScoreOption | null;
-  onPick: (o: ScoreOption) => void;
-  disabled: boolean;
-}) {
-  return (
-    <section className={`rounded-2xl bg-slate-900 p-3 ring-2 ${ringClass}`}>
-      <div className="mb-2 flex items-center justify-between">
-        <h2 className="truncate text-xl font-extrabold">{name}</h2>
-        <span className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
-          {corner} corner
-        </span>
-      </div>
-      <div className="grid grid-cols-3 gap-2">
-        {options.map((o) => {
-          const isSel = selected === o;
-          return (
-            <button
-              key={o.label}
-              onClick={() => onPick(o)}
-              disabled={disabled}
-              className={`h-14 rounded-xl text-xl font-black tabular-nums transition disabled:opacity-40
-                ${
-                  isSel
-                    ? 'bg-slate-50 text-slate-950'
-                    : o.emphasis === 'strong'
-                    ? 'bg-slate-800 text-amber-300'
-                    : 'bg-slate-800 text-slate-100'
-                }`}
-            >
-              {o.label}
-            </button>
-          );
-        })}
-      </div>
-    </section>
   );
 }
 
