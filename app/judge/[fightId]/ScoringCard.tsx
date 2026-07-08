@@ -369,19 +369,6 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     [fight.scheduled_rounds],
   );
 
-  // Running scorecard: base 10-point-must scores minus non-voided deductions
-  // (deductions apply to every judge uniformly).
-  const tally = useMemo(() => {
-    let a = 0;
-    let b = 0;
-    for (const [rnum, s] of Object.entries(savedScores)) {
-      const d = roundDeductionTotals(deductions, Number(rnum), fight);
-      a += s.a - d.a;
-      b += s.b - d.b;
-    }
-    return { a, b };
-  }, [savedScores, deductions, fight]);
-
   const sortedDeductions = useMemo(
     () =>
       deductions
@@ -393,12 +380,35 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     [deductions],
   );
 
-  const hasScores = Object.keys(savedScores).length > 0;
-  const shortA = fight.fighter_a_name.split(' ')[0];
-  const shortB = fight.fighter_b_name.split(' ')[0];
   const formatLabel = `${fight.scheduled_rounds} rounds${
     fight.round_minutes ? ` x ${fight.round_minutes} min` : ''
   }${fight.is_championship ? ' · title' : ''}`;
+
+  // Paper-style scorecard rows, keyed to Red / Blue corners (not fighter A/B).
+  const redIsA = fight.fighter_a_corner === 'red';
+  const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
+  const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
+  const scoreRows = roundOptions.map((r) => {
+    const s = savedScores[r];
+    const d = roundDeductionTotals(deductions, r, fight);
+    const redScore = s ? (redIsA ? s.a : s.b) : null;
+    const blueScore = s ? (redIsA ? s.b : s.a) : null;
+    const redDed = redIsA ? d.a : d.b;
+    const blueDed = redIsA ? d.b : d.a;
+    return {
+      r,
+      redScore,
+      blueScore,
+      redDed,
+      blueDed,
+      redTotal: redScore == null ? null : redScore - redDed,
+      blueTotal: blueScore == null ? null : blueScore - blueDed,
+      note: s?.roundNote ?? null,
+    };
+  });
+  const redTotal = scoreRows.reduce((n, x) => n + (x.redTotal ?? 0), 0);
+  const blueTotal = scoreRows.reduce((n, x) => n + (x.blueTotal ?? 0), 0);
+  const hasScores = Object.keys(savedScores).length > 0;
 
   return (
     <div className="mx-auto flex min-h-dvh max-w-md flex-col bg-slate-950 text-slate-50">
@@ -452,16 +462,84 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         })}
       </nav>
 
-      {/* ---- Format + running card ---- */}
-      <div className="flex items-center justify-between px-4 pb-2 text-xs">
+      {/* ---- Format ---- */}
+      <div className="px-4 pb-1 text-[11px]">
         <span className="font-semibold uppercase tracking-wider text-slate-500">{formatLabel}</span>
-        {hasScores && (
-          <span className="font-bold text-slate-200">
-            Card: {shortA} <span className="tabular-nums">{tally.a}</span>
-            <span className="text-slate-500"> — </span>
-            <span className="tabular-nums">{tally.b}</span> {shortB}
-          </span>
-        )}
+      </div>
+
+      {/* ---- Compact scorecard (paper style, keyed to Red / Blue) ---- */}
+      <div className="mx-4 mb-2 overflow-hidden rounded-xl ring-1 ring-slate-800">
+        <table className="w-full text-center text-sm">
+          <thead>
+            <tr className="bg-slate-900 text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              <th className="py-1.5">Rd</th>
+              <th className="py-1.5">
+                <span className="text-red-400">Red</span> {redName.split(' ')[0]}
+              </th>
+              <th className="py-1.5">
+                <span className="text-sky-400">Blue</span> {blueName.split(' ')[0]}
+              </th>
+              <th className="py-1.5">Note</th>
+            </tr>
+          </thead>
+          <tbody>
+            {scoreRows.map((x) => (
+              <tr
+                key={x.r}
+                className={`border-t border-slate-800 ${x.r === round ? 'bg-slate-800/40' : ''}`}
+              >
+                <td className="py-1.5 font-black text-slate-400">{x.r}</td>
+                <td className="py-1.5 font-bold tabular-nums text-slate-100">
+                  {x.redScore == null ? (
+                    <span className="text-slate-600">·</span>
+                  ) : (
+                    <>
+                      {x.redTotal}
+                      {x.redDed > 0 && (
+                        <span className="text-[10px] font-normal text-red-400"> (-{x.redDed})</span>
+                      )}
+                    </>
+                  )}
+                </td>
+                <td className="py-1.5 font-bold tabular-nums text-slate-100">
+                  {x.blueScore == null ? (
+                    <span className="text-slate-600">·</span>
+                  ) : (
+                    <>
+                      {x.blueTotal}
+                      {x.blueDed > 0 && (
+                        <span className="text-[10px] font-normal text-red-400"> (-{x.blueDed})</span>
+                      )}
+                    </>
+                  )}
+                </td>
+                <td className="py-1.5 text-[10px] font-bold uppercase text-amber-300">
+                  {x.note ? x.note[0] : ''}
+                </td>
+              </tr>
+            ))}
+            <tr className="border-t border-slate-700 bg-slate-900 font-black">
+              <td className="py-1.5 text-[10px] uppercase tracking-wider text-slate-400">Tot</td>
+              <td
+                className={`py-1.5 tabular-nums ${
+                  hasScores && redTotal > blueTotal ? 'text-emerald-300' : 'text-slate-100'
+                }`}
+              >
+                {redTotal}
+              </td>
+              <td
+                className={`py-1.5 tabular-nums ${
+                  hasScores && blueTotal > redTotal ? 'text-emerald-300' : 'text-slate-100'
+                }`}
+              >
+                {blueTotal}
+              </td>
+              <td className="py-1.5 text-[10px] uppercase text-emerald-300">
+                {!hasScores ? '' : redTotal > blueTotal ? 'Red' : blueTotal > redTotal ? 'Blue' : '='}
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
 
       {/* ---- Deductions (shown on every judge's card) ---- */}
@@ -626,7 +704,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       )}
 
       {/* ---- Fighter columns ---- */}
-      <main className="flex flex-1 flex-col gap-4 px-4">
+      <main className="flex flex-1 flex-col gap-3 px-4">
         <FighterColumn
           name={fight.fighter_a_name}
           corner={fight.fighter_a_corner}
@@ -641,7 +719,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           <button
             onClick={chooseEven}
             disabled={pickDisabled}
-            className={`h-14 w-full rounded-xl border-2 text-lg font-bold transition disabled:opacity-40 ${
+            className={`h-12 w-full rounded-xl border-2 text-base font-bold transition disabled:opacity-40 ${
               selected?.winner === 'even'
                 ? 'border-slate-50 bg-slate-50 text-slate-950'
                 : 'border-slate-700 text-slate-300'
@@ -703,7 +781,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
             onChange={(e) => setNote(e.target.value)}
             disabled={pickDisabled}
             placeholder="Note (optional): foul, knockdown, etc."
-            className="min-h-[8rem] flex-1 resize-none rounded-xl bg-slate-900 p-3 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600 disabled:opacity-50"
+            className="min-h-[4.5rem] flex-1 resize-none rounded-xl bg-slate-900 p-3 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600 disabled:opacity-50"
           />
         </div>
 
@@ -734,7 +812,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           onClick={handleConfirm}
           disabled={confirmDisabled}
           aria-live="polite"
-          className={`h-20 w-full rounded-2xl text-2xl font-black uppercase tracking-wide transition
+          className={`h-16 w-full rounded-2xl text-xl font-black uppercase tracking-wide transition
             active:scale-[0.98] disabled:active:scale-100
             ${
               submit === 'saved'
@@ -811,7 +889,7 @@ function FighterColumn({
               key={o.label}
               onClick={() => onPick(o)}
               disabled={disabled}
-              className={`h-16 rounded-xl text-xl font-black tabular-nums transition disabled:opacity-40
+              className={`h-14 rounded-xl text-xl font-black tabular-nums transition disabled:opacity-40
                 ${
                   isSel
                     ? 'bg-slate-50 text-slate-950'
