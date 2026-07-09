@@ -1,9 +1,10 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { enqueueScore, pendingCount, registerAutoFlush } from '@/lib/offlineQueue';
-import { A_WINS, B_WINS, EVEN, type MarginTag, type ScoreOption } from '@/lib/scoring';
+import { A_WINS, B_WINS, EVEN, winnerOptions, type MarginTag, type ScoreOption } from '@/lib/scoring';
 
 interface Fight {
   id: string;
@@ -21,6 +22,16 @@ interface Fight {
 type SubmitState = 'idle' | 'submitting' | 'saved' | 'pending' | 'error';
 type RoundState = 'pending' | 'live' | 'locked';
 type SavedScore = { a: number; b: number; note: string | null; tag: MarginTag | null };
+type FinishMethod = 'ko' | 'tko' | 'submission' | 'dq' | 'other';
+type FinishFlag = { round_number: number; method: FinishMethod; note: string | null };
+
+const FINISH_LABEL: Record<FinishMethod, string> = {
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  other: 'Other',
+};
 
 // Every option references a stable module constant, so we can identify the
 // current pick by reference (labels now collide across columns: A and B both
@@ -43,6 +54,11 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   const [roundStates, setRoundStates] = useState<Record<number, RoundState>>({});
   const [deductions, setDeductions] = useState<Record<number, { a: number; b: number }>>({});
   const [savedScores, setSavedScores] = useState<Record<number, SavedScore>>({});
+  const [finishFlag, setFinishFlag] = useState<FinishFlag | null>(null);
+  const [flagging, setFlagging] = useState(false);
+  const [flagMethod, setFlagMethod] = useState<FinishMethod>('tko');
+  const [flagNote, setFlagNote] = useState('');
+  const [flagBusy, setFlagBusy] = useState(false);
 
   // Ref mirror of savedScores so round switches read the latest map without
   // re-subscribing effects.
@@ -87,7 +103,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     let active = true;
 
     async function load() {
-      const [{ data: scoreRows }, { data: roundRows }] = await Promise.all([
+      const [{ data: scoreRows }, { data: roundRows }, { data: flagRows }] = await Promise.all([
         supabase
           .from('scores')
           .select('round_number, fighter_a_score, fighter_b_score, note, margin_tag')
@@ -97,8 +113,15 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           .from('rounds')
           .select('round_number, state, fighter_a_deduction, fighter_b_deduction')
           .eq('fight_id', fight.id),
+        supabase
+          .from('judge_finish_flags')
+          .select('round_number, method, note')
+          .eq('fight_id', fight.id)
+          .eq('judge_id', judgeId),
       ]);
       if (!active) return;
+
+      setFinishFlag((flagRows?.[0] as FinishFlag | undefined) ?? null);
 
       const scores: Record<number, SavedScore> = {};
       scoreRows?.forEach((r) => {
@@ -162,21 +185,104 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     applyRound(round);
   }, [round, applyRound]);
 
+  // A round switch (official advancing, or the judge tapping a tab) does not
+  // silently discard a picked-but-unconfirmed score: the card holds with a
+  // prompt, advances once the score is confirmed, or leaves on a second tap.
+  const [blockedTarget, setBlockedTarget] = useState<number | null>(null);
+
+  const hasUnconfirmedPick = useCallback(() => {
+    return (
+      roundStates[round] === 'live' &&
+      !!selected &&
+      submit !== 'saved' &&
+      submit !== 'pending' &&
+      submit !== 'submitting'
+    );
+  }, [roundStates, round, selected, submit]);
+
+  const requestRound = useCallback(
+    (target: number) => {
+      if (target === round) return;
+      if (hasUnconfirmedPick() && blockedTarget !== target) {
+        setBlockedTarget(target);
+        return;
+      }
+      setBlockedTarget(null);
+      setRound(target);
+    },
+    [round, hasUnconfirmedPick, blockedTarget],
+  );
+
   // Follow the official when they advance the live round.
   useEffect(() => {
+    if (fight.current_round === round) return;
+    if (hasUnconfirmedPick()) {
+      setBlockedTarget(fight.current_round);
+      return;
+    }
+    setBlockedTarget(null);
     setRound(fight.current_round);
+    // Only the official's advance should trigger this follow.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fight.current_round]);
 
-  const cornerClass = (corner: string) =>
-    corner === 'red' ? 'ring-red-500/70' : corner === 'blue' ? 'ring-sky-500/70' : 'ring-slate-500/70';
+  // Release a held switch as soon as it is no longer blocked: the score got
+  // confirmed, or the round locked out from under the judge (which makes the
+  // pick unsubmittable anyway). Without this the amber "submit first" banner
+  // could point at a disabled CONFIRM button, a dead end.
+  useEffect(() => {
+    if (blockedTarget !== null && !hasUnconfirmedPick()) {
+      setRound(blockedTarget);
+      setBlockedTarget(null);
+    }
+  }, [blockedTarget, hasUnconfirmedPick]);
 
   const roundState: RoundState = roundStates[round] ?? 'pending';
   const roundLive = roundState === 'live';
   const roundLocked = roundState === 'locked';
 
-  // Can only pick/edit a score on a live round that has not been submitted yet.
-  const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved';
+  // Can only pick/edit a score on a live round that has not been submitted
+  // yet, and not after this judge has marked the fight finished.
+  const pickDisabled = !roundLive || submit === 'submitting' || submit === 'saved' || !!finishFlag;
   const confirmDisabled = pickDisabled || !selected || !judgeId;
+
+  // The judge's own finish observation. Closes THEIR card only: the official
+  // still closes the bout, and the official's result always overrules this.
+  async function saveFinishFlag() {
+    if (!judgeId || flagBusy) return;
+    setFlagBusy(true);
+    // Record the live round the official is on, not whichever tab the judge is
+    // viewing, so a finish flagged while reviewing an earlier round is not
+    // misattributed.
+    const finishRound = fight.current_round;
+    const { error } = await supabase.from('judge_finish_flags').upsert(
+      {
+        fight_id: fight.id,
+        judge_id: judgeId,
+        round_number: finishRound,
+        method: flagMethod,
+        note: flagNote.trim() || null,
+      },
+      { onConflict: 'fight_id,judge_id' },
+    );
+    if (!error) {
+      setFinishFlag({ round_number: finishRound, method: flagMethod, note: flagNote.trim() || null });
+      setFlagging(false);
+    }
+    setFlagBusy(false);
+  }
+
+  async function undoFinishFlag() {
+    if (!judgeId || flagBusy) return;
+    setFlagBusy(true);
+    const { error } = await supabase
+      .from('judge_finish_flags')
+      .delete()
+      .eq('fight_id', fight.id)
+      .eq('judge_id', judgeId);
+    if (!error) setFinishFlag(null);
+    setFlagBusy(false);
+  }
 
   const handleConfirm = useCallback(async () => {
     // ---- STATE LOCK: block re-entry so a double-tap can't double-submit ----
@@ -203,6 +309,8 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       setSavedScores(savedRef.current);
       setSubmit(reachedServer ? 'saved' : 'pending');
       setQueued(await pendingCount());
+      // A held round switch is released by the blockedTarget effect once submit
+      // flips away from an unconfirmed pick.
     } catch {
       setSubmit('error');
     }
@@ -236,8 +344,13 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
     <div className="mx-auto flex min-h-dvh max-w-md flex-col bg-slate-950 text-slate-50">
       {/* ---- Status bar ---- */}
       <header className="flex items-center justify-between px-4 pt-[max(env(safe-area-inset-top),1rem)] pb-3">
-        <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-          NZMMAF · Roundmaster
+        <span className="flex items-center gap-2">
+          <Link href="/login" className="text-lg leading-none text-slate-500">
+            ‹
+          </Link>
+          <span className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+            NZMMAF · Roundmaster
+          </span>
         </span>
         <span
           className={`rounded-full px-3 py-1 text-xs font-bold ${
@@ -257,7 +370,7 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
           return (
             <button
               key={r}
-              onClick={() => setRound(r)}
+              onClick={() => requestRound(r)}
               className={`relative h-12 flex-1 rounded-xl text-lg font-bold transition ${
                 isCur ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
               }`}
@@ -293,18 +406,43 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
 
       {/* ---- Bout-complete banner ---- */}
       {fight.state === 'completed' && (
-        <p className="mx-4 mb-2 rounded-lg bg-emerald-500/10 px-3 py-2 text-center text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">
-          Bout complete. The official has recorded the result.
-        </p>
+        <div className="mx-4 mb-2 space-y-2">
+          <p className="rounded-lg bg-emerald-500/10 px-3 py-2 text-center text-xs font-semibold text-emerald-300 ring-1 ring-emerald-500/30">
+            Bout complete. The official has recorded the result.
+          </p>
+          <Link
+            href="/login"
+            className="block h-12 rounded-xl bg-slate-50 text-center text-sm font-bold leading-[3rem] text-slate-950"
+          >
+            Back to your bouts
+          </Link>
+        </div>
       )}
       {fight.state === 'cancelled' && (
-        <p className="mx-4 mb-2 rounded-lg bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
-          This bout was cancelled.
+        <div className="mx-4 mb-2 space-y-2">
+          <p className="rounded-lg bg-red-500/10 px-3 py-2 text-center text-xs font-semibold text-red-300 ring-1 ring-red-500/30">
+            This bout was cancelled.
+          </p>
+          <Link
+            href="/login"
+            className="block h-12 rounded-xl bg-slate-50 text-center text-sm font-bold leading-[3rem] text-slate-950"
+          >
+            Back to your bouts
+          </Link>
+        </div>
+      )}
+
+      {/* ---- Unsubmitted score hold ---- */}
+      {blockedTarget !== null && (
+        <p className="mx-4 mb-2 rounded-lg bg-amber-500/10 px-3 py-2 text-center text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30">
+          Round {blockedTarget} is waiting, but this round&apos;s score is not submitted. Tap
+          CONFIRM SCORE to submit it, or tap round {blockedTarget} again to leave without
+          submitting.
         </p>
       )}
 
       {/* ---- Round status banner ---- */}
-      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && (
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && !roundLive && !finishFlag && (
         <p className="mx-4 mb-2 rounded-lg bg-slate-800/60 px-3 py-2 text-center text-xs font-semibold text-slate-300">
           {roundLocked
             ? 'Round locked. Scores are final.'
@@ -312,13 +450,81 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         </p>
       )}
 
+      {/* ---- Judge finish flag: closes this judge's card only ---- */}
+      {fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <div className="mx-4 mb-2">
+          {finishFlag ? (
+            <div className="space-y-2 rounded-lg bg-amber-500/10 px-3 py-2 ring-1 ring-amber-500/30">
+              <p className="text-center text-xs font-semibold text-amber-300">
+                You marked this fight finished in R{finishFlag.round_number} by{' '}
+                {FINISH_LABEL[finishFlag.method]}
+                {finishFlag.note ? ` (${finishFlag.note})` : ''}. Your card is closed; the
+                official records the result.
+              </p>
+              <button
+                onClick={undoFinishFlag}
+                disabled={flagBusy}
+                className="mx-auto block text-xs font-semibold text-amber-200 underline underline-offset-2 disabled:opacity-40"
+              >
+                Undo
+              </button>
+            </div>
+          ) : flagging ? (
+            <div className="space-y-2 rounded-lg bg-slate-900 p-3 ring-1 ring-slate-700">
+              <p className="text-[10px] font-bold uppercase tracking-widest text-slate-500">
+                Fight finished in round {fight.current_round}: how?
+              </p>
+              <div className="grid grid-cols-5 gap-1">
+                {(Object.keys(FINISH_LABEL) as FinishMethod[]).map((m) => (
+                  <button
+                    key={m}
+                    onClick={() => setFlagMethod(m)}
+                    className={`h-10 rounded-lg text-[11px] font-bold uppercase transition ${
+                      flagMethod === m ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
+                    }`}
+                  >
+                    {FINISH_LABEL[m]}
+                  </button>
+                ))}
+              </div>
+              <input
+                value={flagNote}
+                onChange={(e) => setFlagNote(e.target.value)}
+                placeholder="Detail (e.g. knockout via punch)"
+                className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
+              />
+              <div className="flex gap-2">
+                <button
+                  onClick={saveFinishFlag}
+                  disabled={flagBusy}
+                  className="h-10 flex-1 rounded-lg bg-amber-500 text-xs font-bold text-slate-950 disabled:opacity-40"
+                >
+                  Confirm (closes my card)
+                </button>
+                <button
+                  onClick={() => setFlagging(false)}
+                  className="h-10 rounded-lg bg-slate-800 px-4 text-xs font-bold text-slate-300"
+                >
+                  Back
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={() => setFlagging(true)}
+              className="mx-auto block text-xs font-semibold text-slate-400 underline decoration-dotted underline-offset-2"
+            >
+              Fight finished? Mark it
+            </button>
+          )}
+        </div>
+      )}
+
       {/* ---- Fighter columns ---- */}
       <main className="flex flex-1 flex-col gap-4 px-4">
         <FighterColumn
-          name={fight.fighter_a_name}
-          corner={fight.fighter_a_corner}
-          ringClass={cornerClass(fight.fighter_a_corner)}
-          options={A_WINS}
+          fight={fight}
+          fighter="a"
           selected={selected}
           onPick={setSelected}
           disabled={pickDisabled}
@@ -337,10 +543,8 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         </button>
 
         <FighterColumn
-          name={fight.fighter_b_name}
-          corner={fight.fighter_b_corner}
-          ringClass={cornerClass(fight.fighter_b_corner)}
-          options={B_WINS}
+          fight={fight}
+          fighter="b"
           selected={selected}
           onPick={setSelected}
           disabled={pickDisabled}
@@ -421,23 +625,31 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   );
 }
 
+// One source of truth per column: pass only the fighter key and the fight.
+// Name, corner label, ring colour and winner buttons all derive from the same
+// fighter, so a red-corner win can never be recorded against the blue fighter.
 function FighterColumn({
-  name,
-  corner,
-  ringClass,
-  options,
+  fight,
+  fighter,
   selected,
   onPick,
   disabled,
 }: {
-  name: string;
-  corner: string;
-  ringClass: string;
-  options: ScoreOption[];
+  fight: Fight;
+  fighter: 'a' | 'b';
   selected: ScoreOption | null;
   onPick: (o: ScoreOption) => void;
   disabled: boolean;
 }) {
+  const name = fighter === 'a' ? fight.fighter_a_name : fight.fighter_b_name;
+  const corner = fighter === 'a' ? fight.fighter_a_corner : fight.fighter_b_corner;
+  const options = winnerOptions(fighter);
+  const ringClass =
+    corner === 'red'
+      ? 'ring-red-500/70'
+      : corner === 'blue'
+      ? 'ring-sky-500/70'
+      : 'ring-slate-500/70';
   return (
     <section className={`rounded-2xl bg-slate-900 p-3 ring-2 ${ringClass}`}>
       <div className="mb-2 flex items-center justify-between">

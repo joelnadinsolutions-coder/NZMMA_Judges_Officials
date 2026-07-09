@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "cross-env NODE_OPTIONS=--require=./scripts/patch-node24-readlink.cjs next dev",
     "build": "cross-env NODE_OPTIONS=--require=./scripts/patch-node24-readlink.cjs next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "cross-env NODE_OPTIONS=--experimental-strip-types node --test 'lib/**/*.test.ts'"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",

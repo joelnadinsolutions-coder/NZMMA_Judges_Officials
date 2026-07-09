@@ -4,6 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { isApprovedOfficial, Loading, NotAuthorized } from '@/components/officials';
+import { CreateFight, type NewBout } from '@/components/bouts';
 
 interface EventRow {
   id: string;
@@ -11,6 +12,7 @@ interface EventRow {
   event_date: string;
   region: string | null;
   is_live: boolean;
+  archived_at: string | null;
 }
 type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 interface FightRow {
@@ -40,31 +42,68 @@ export default function EventsPage() {
   const [judges, setJudges] = useState<JudgeRow[]>([]);
   const [assignments, setAssignments] = useState<Record<string, string[]>>({}); // fightId -> judgeIds
   const [busy, setBusy] = useState(false);
+  const [search, setSearch] = useState('');
+  const [showArchived, setShowArchived] = useState(false);
+  const [loadedArchived, setLoadedArchived] = useState<Set<string>>(new Set());
 
-  const load = useCallback(async () => {
-    const [{ data: ev }, { data: fi }, { data: pr }, { data: fj }] = await Promise.all([
-      supabase
-        .from('events')
-        .select('id, name, event_date, region, is_live')
-        .order('event_date', { ascending: false }),
-      supabase
-        .from('fights')
-        .select(
-          'id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, result_method, result_winner, result_round',
-        )
-        .order('bout_order'),
-      supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
-      supabase.from('fight_judges').select('fight_id, judge_id'),
-    ]);
-    setEvents((ev ?? []) as EventRow[]);
-    setFights((fi ?? []) as FightRow[]);
-    setJudges((pr ?? []).map((p) => ({ id: p.id, name: p.full_name })));
-    const map: Record<string, string[]> = {};
-    (fj ?? []).forEach((row) => {
-      (map[row.fight_id] ??= []).push(row.judge_id);
+  const FIGHT_COLS =
+    'id, event_id, bout_order, weight_class, fighter_a_name, fighter_b_name, scheduled_rounds, state, result_method, result_winner, result_round, fight_judges(judge_id)';
+
+  type FightWithJudges = FightRow & { fight_judges?: { judge_id: string }[] };
+  const applyFightRows = useCallback((rows: FightWithJudges[]) => {
+    setFights((prev) => {
+      const touchedEvents = new Set(rows.map((r) => r.event_id));
+      const kept = prev.filter((f) => !touchedEvents.has(f.event_id));
+      return [...kept, ...rows.map(({ fight_judges, ...f }) => f)];
     });
-    setAssignments(map);
-  }, [supabase]);
+    setAssignments((prev) => {
+      const next = { ...prev };
+      rows.forEach((r) => {
+        next[r.id] = (r.fight_judges ?? []).map((fj) => fj.judge_id);
+      });
+      return next;
+    });
+  }, []);
+
+  // Only active (non-archived) events load their bouts up front; archived
+  // events (which accumulate without bound over seasons) load lazily when
+  // expanded, so the list stays cheap no matter how much history piles up.
+  const load = useCallback(async () => {
+    const { data: ev } = await supabase
+      .from('events')
+      .select('id, name, event_date, region, is_live, archived_at')
+      .order('event_date', { ascending: false });
+    const evs = (ev ?? []) as EventRow[];
+    setEvents(evs);
+    const activeIds = evs.filter((e) => !e.archived_at).map((e) => e.id);
+    const [{ data: fi }, { data: pr }] = await Promise.all([
+      activeIds.length
+        ? supabase.from('fights').select(FIGHT_COLS).in('event_id', activeIds).order('bout_order')
+        : Promise.resolve({ data: [] as FightWithJudges[] }),
+      supabase.from('profiles').select('id, full_name').eq('status', 'approved'),
+    ]);
+    setJudges((pr ?? []).map((p) => ({ id: p.id, name: p.full_name })));
+    setFights([]);
+    setAssignments({});
+    setLoadedArchived(new Set());
+    applyFightRows((fi ?? []) as FightWithJudges[]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [supabase, applyFightRows]);
+
+  const loadEventBouts = useCallback(
+    async (eventId: string) => {
+      if (loadedArchived.has(eventId)) return;
+      setLoadedArchived((prev) => new Set(prev).add(eventId));
+      const { data } = await supabase
+        .from('fights')
+        .select(FIGHT_COLS)
+        .eq('event_id', eventId)
+        .order('bout_order');
+      applyFightRows((data ?? []) as FightWithJudges[]);
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    },
+    [supabase, loadedArchived, applyFightRows],
+  );
 
   useEffect(() => {
     (async () => {
@@ -89,16 +128,7 @@ export default function EventsPage() {
     setBusy(false);
   }
 
-  async function createFight(
-    eventId: string,
-    data: {
-      fighter_a_name: string;
-      fighter_b_name: string;
-      weight_class: string;
-      scheduled_rounds: number;
-      round_minutes: number;
-    },
-  ) {
+  async function createFight(eventId: string, data: NewBout) {
     if (busy) return;
     setBusy(true);
     const nextOrder =
@@ -128,6 +158,19 @@ export default function EventsPage() {
     setBusy(false);
   }
 
+  async function setArchived(eventId: string, archived: boolean) {
+    if (busy) return;
+    setBusy(true);
+    // Archiving also takes the event off live; unarchiving leaves is_live
+    // alone so it comes back in whatever state it was.
+    const patch = archived
+      ? { archived_at: new Date().toISOString(), is_live: false }
+      : { archived_at: null };
+    await supabase.from('events').update(patch).eq('id', eventId);
+    await load();
+    setBusy(false);
+  }
+
   async function toggleAssign(fightId: string, judgeId: string, assigned: boolean) {
     if (busy) return;
     setBusy(true);
@@ -143,6 +186,45 @@ export default function EventsPage() {
   if (authorized === null) return <Loading />;
   if (!authorized) return <NotAuthorized />;
 
+  const q = search.trim().toLowerCase();
+  const matches = (ev: EventRow) => !q || ev.name.toLowerCase().includes(q);
+  const active = events.filter((ev) => !ev.archived_at && matches(ev));
+  const archived = events.filter((ev) => ev.archived_at && matches(ev));
+  const eventFights = (eventId: string) => fights.filter((f) => f.event_id === eventId);
+  // Archiving unlocks once every bout on the card is finished one way or the other.
+  const canArchive = (eventId: string) => {
+    const fs = eventFights(eventId);
+    return fs.length > 0 && fs.every((f) => f.state === 'completed' || f.state === 'cancelled');
+  };
+
+  const renderEvent = (ev: EventRow, defaultOpen: boolean) => (
+    <EventSection
+      key={ev.id}
+      event={ev}
+      defaultOpen={defaultOpen}
+      boutCount={eventFights(ev.id).length}
+      countKnown={!ev.archived_at || loadedArchived.has(ev.id)}
+      canArchive={canArchive(ev.id)}
+      busy={busy}
+      onExpand={ev.archived_at ? () => loadEventBouts(ev.id) : undefined}
+      onToggleLive={() => toggleLive(ev.id, ev.is_live)}
+      onArchive={() => setArchived(ev.id, !ev.archived_at)}
+    >
+      {eventFights(ev.id).map((f) => (
+        <FightCard
+          key={f.id}
+          fight={f}
+          judges={judges}
+          assigned={assignments[f.id] ?? []}
+          busy={busy}
+          onToggle={toggleAssign}
+        />
+      ))}
+
+      <CreateFight onCreate={(data) => createFight(ev.id, data)} busy={busy} />
+    </EventSection>
+  );
+
   return (
     <div className="mx-auto min-h-dvh max-w-md space-y-5 bg-slate-950 px-4 py-6 text-slate-50">
       <header className="flex items-center gap-3">
@@ -154,46 +236,140 @@ export default function EventsPage() {
 
       <CreateEvent onCreate={createEvent} busy={busy} />
 
+      {events.length > 0 && (
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search events"
+          className="h-11 w-full rounded-xl bg-slate-900 px-4 text-sm text-slate-100 ring-1 ring-slate-800 placeholder:text-slate-600"
+        />
+      )}
+
       {events.length === 0 && <p className="text-sm text-slate-500">No events yet.</p>}
+      {events.length > 0 && active.length === 0 && archived.length === 0 && (
+        <p className="text-sm text-slate-500">No events match your search.</p>
+      )}
 
-      {events.map((ev) => (
-        <section key={ev.id} className="space-y-3 rounded-2xl bg-slate-900 p-4">
-          <div className="flex items-center justify-between gap-2">
-            <div>
-              <h2 className="text-lg font-black">{ev.name}</h2>
-              <p className="text-xs text-slate-400">
-                {ev.event_date}
-                {ev.region ? ` · ${ev.region}` : ''}
-              </p>
-            </div>
-            <button
-              onClick={() => toggleLive(ev.id, ev.is_live)}
-              disabled={busy}
-              className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold uppercase tracking-widest disabled:opacity-40 ${
-                ev.is_live ? 'bg-emerald-500 text-white' : 'bg-slate-800 text-slate-400'
-              }`}
-            >
-              {ev.is_live ? '● Live' : 'Go live'}
-            </button>
-          </div>
+      {active.map((ev) => renderEvent(ev, ev.is_live || active.length === 1))}
 
-          {fights
-            .filter((f) => f.event_id === ev.id)
-            .map((f) => (
-              <FightCard
-                key={f.id}
-                fight={f}
-                judges={judges}
-                assigned={assignments[f.id] ?? []}
-                busy={busy}
-                onToggle={toggleAssign}
-              />
-            ))}
-
-          <CreateFight eventId={ev.id} onCreate={createFight} busy={busy} />
+      {archived.length > 0 && (
+        <section className="space-y-3">
+          <button
+            onClick={() => setShowArchived((s) => !s)}
+            className="text-sm font-semibold text-slate-400"
+          >
+            {showArchived ? '▾' : '▸'} Archived events ({archived.length})
+          </button>
+          {showArchived && archived.map((ev) => renderEvent(ev, false))}
         </section>
-      ))}
+      )}
     </div>
+  );
+}
+
+// Collapsible event section: several events can run on one night, so each
+// folds down to a single header row until opened.
+function EventSection({
+  event,
+  defaultOpen,
+  boutCount,
+  countKnown,
+  canArchive,
+  busy,
+  onExpand,
+  onToggleLive,
+  onArchive,
+  children,
+}: {
+  event: EventRow;
+  defaultOpen: boolean;
+  boutCount: number;
+  countKnown: boolean;
+  canArchive: boolean;
+  busy: boolean;
+  onExpand?: () => void;
+  onToggleLive: () => void;
+  onArchive: () => void;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  const isArchived = Boolean(event.archived_at);
+
+  // Lazy-load an archived event's bouts the first time it is opened.
+  function toggleOpen() {
+    setOpen((o) => {
+      const next = !o;
+      if (next) onExpand?.();
+      return next;
+    });
+  }
+
+  return (
+    <section className="space-y-3 rounded-2xl bg-slate-900 p-4">
+      <div className="flex items-center gap-2">
+        <button
+          onClick={toggleOpen}
+          className="shrink-0 px-1 text-lg text-slate-400"
+          aria-label={open ? `Collapse ${event.name}` : `Expand ${event.name}`}
+        >
+          {open ? '▾' : '▸'}
+        </button>
+        <button onClick={toggleOpen} className="min-w-0 flex-1 text-left">
+          <h2 className="truncate text-lg font-black">{event.name}</h2>
+          <p className="text-xs text-slate-400">
+            {event.event_date}
+            {event.region ? ` · ${event.region}` : ''}
+            {countKnown ? ` · ${boutCount} bout${boutCount === 1 ? '' : 's'}` : ''}
+          </p>
+        </button>
+        {isArchived ? (
+          <span className="shrink-0 rounded-full bg-slate-800 px-3 py-1 text-xs font-bold uppercase tracking-widest text-slate-500">
+            Archived
+          </span>
+        ) : (
+          <button
+            onClick={onToggleLive}
+            disabled={busy}
+            className={`shrink-0 rounded-full px-3 py-1 text-xs font-bold uppercase tracking-widest disabled:opacity-40 ${
+              event.is_live ? 'bg-emerald-500 text-white' : 'bg-slate-800 text-slate-400'
+            }`}
+          >
+            {event.is_live ? '● Live' : 'Go live'}
+          </button>
+        )}
+      </div>
+
+      {open && (
+        <>
+          <Link
+            href={`/admin/events/${event.id}`}
+            className="block h-10 rounded-lg bg-slate-800 text-center text-xs font-bold leading-10 text-slate-200"
+          >
+            Open run sheet ›
+          </Link>
+          {children}
+          {isArchived ? (
+            <button
+              onClick={onArchive}
+              disabled={busy}
+              className="h-10 w-full rounded-lg bg-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
+            >
+              Unarchive event
+            </button>
+          ) : (
+            canArchive && (
+              <button
+                onClick={onArchive}
+                disabled={busy}
+                className="h-10 w-full rounded-lg bg-slate-800 text-xs font-bold text-slate-300 disabled:opacity-40"
+              >
+                Archive event (all bouts finished)
+              </button>
+            )
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -279,6 +455,18 @@ function FightCard({
   onToggle: (fightId: string, judgeId: string, assigned: boolean) => void;
 }) {
   const [showJudges, setShowJudges] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  async function copyJudgeLink() {
+    try {
+      await navigator.clipboard.writeText(`${window.location.origin}/judge/${fight.id}`);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // Clipboard unavailable (old browser, insecure context): do nothing.
+    }
+  }
+
   const stateCls =
     fight.state === 'in_progress'
       ? 'bg-emerald-500/15 text-emerald-300'
@@ -325,12 +513,20 @@ function FightCard({
         </Link>
       </div>
 
-      <button
-        onClick={() => setShowJudges((s) => !s)}
-        className="mt-2 text-xs font-semibold text-slate-400"
-      >
-        {showJudges ? 'Hide judges' : 'Assign judges'}
-      </button>
+      <div className="mt-2 flex items-center gap-4">
+        <button
+          onClick={() => setShowJudges((s) => !s)}
+          className="text-xs font-semibold text-slate-400"
+        >
+          {showJudges ? 'Hide judges' : 'Assign judges'}
+        </button>
+        <button
+          onClick={copyJudgeLink}
+          className={`text-xs font-semibold ${copied ? 'text-emerald-300' : 'text-slate-400'}`}
+        >
+          {copied ? 'Link copied ✓' : 'Copy judge link'}
+        </button>
+      </div>
 
       {showJudges && (
         <div className="mt-2 space-y-1">
@@ -355,130 +551,6 @@ function FightCard({
           })}
         </div>
       )}
-    </div>
-  );
-}
-
-function CreateFight({
-  eventId,
-  onCreate,
-  busy,
-}: {
-  eventId: string;
-  onCreate: (
-    eventId: string,
-    data: {
-      fighter_a_name: string;
-      fighter_b_name: string;
-      weight_class: string;
-      scheduled_rounds: number;
-      round_minutes: number;
-    },
-  ) => void;
-  busy: boolean;
-}) {
-  const [open, setOpen] = useState(false);
-  const [a, setA] = useState('');
-  const [b, setB] = useState('');
-  const [weight, setWeight] = useState('');
-  const [rounds, setRounds] = useState(3);
-  const [minutes, setMinutes] = useState(5);
-
-  if (!open) {
-    return (
-      <button
-        onClick={() => setOpen(true)}
-        className="h-10 w-full rounded-lg bg-slate-800 text-sm font-bold text-slate-300"
-      >
-        + Add bout
-      </button>
-    );
-  }
-  return (
-    <div className="space-y-2 rounded-xl bg-slate-950/60 p-3">
-      <input
-        value={a}
-        onChange={(e) => setA(e.target.value)}
-        placeholder="Fighter A name"
-        className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
-      />
-      <input
-        value={b}
-        onChange={(e) => setB(e.target.value)}
-        placeholder="Fighter B name"
-        className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
-      />
-      <input
-        value={weight}
-        onChange={(e) => setWeight(e.target.value)}
-        placeholder="Weight class"
-        className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
-      />
-      <div className="flex gap-2">
-        <Pick label="Rounds" value={rounds} options={[3, 5]} onChange={setRounds} suffix="" />
-        <Pick label="Length" value={minutes} options={[3, 5]} onChange={setMinutes} suffix="m" />
-      </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => {
-            onCreate(eventId, {
-              fighter_a_name: a.trim(),
-              fighter_b_name: b.trim(),
-              weight_class: weight.trim() || 'Catchweight',
-              scheduled_rounds: rounds,
-              round_minutes: minutes,
-            });
-            setA('');
-            setB('');
-            setWeight('');
-            setOpen(false);
-          }}
-          disabled={busy || !a.trim() || !b.trim()}
-          className="h-10 flex-1 rounded-lg bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
-        >
-          Create bout
-        </button>
-        <button
-          onClick={() => setOpen(false)}
-          className="h-10 rounded-lg bg-slate-800 px-4 text-sm font-bold text-slate-300"
-        >
-          Cancel
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function Pick({
-  label,
-  value,
-  options,
-  onChange,
-  suffix,
-}: {
-  label: string;
-  value: number;
-  options: number[];
-  onChange: (v: number) => void;
-  suffix: string;
-}) {
-  return (
-    <div className="flex-1">
-      <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">{label}</p>
-      <div className="flex gap-1">
-        {options.map((o) => (
-          <button
-            key={o}
-            onClick={() => onChange(o)}
-            className={`h-9 flex-1 rounded-lg text-sm font-bold transition ${
-              value === o ? 'bg-slate-50 text-slate-950' : 'bg-slate-800 text-slate-300'
-            }`}
-          >
-            {o}
-            {suffix}
-          </button>
-        ))}
-      </div>
     </div>
   );
 }

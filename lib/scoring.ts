@@ -42,3 +42,43 @@ export const B_WINS: ScoreOption[] = [
 ];
 
 export const EVEN: ScoreOption = { label: '10-10', a: 10, b: 10, winner: 'even' };
+
+/**
+ * Single source of truth for the scoring card.
+ *
+ * The card renders one column per fighter. Everything about a column (the
+ * fighter's name, corner colour, the winner buttons, and the saved payload)
+ * must derive from the SAME fighter key ('a' | 'b') plus the fight record, so
+ * a red-corner win can never be recorded against the blue fighter. Nothing is
+ * mapped by array position.
+ */
+export type Corner = 'red' | 'blue';
+
+/** The winning options for a fighter (that fighter scores the 10). */
+export function winnerOptions(fighter: 'a' | 'b'): ScoreOption[] {
+  return fighter === 'a' ? A_WINS : B_WINS;
+}
+
+/** Which fighter ('a' | 'b') is in the given corner, per the fight record. */
+export function fighterInCorner(
+  fight: { fighter_a_corner: string; fighter_b_corner: string },
+  corner: Corner,
+): 'a' | 'b' | null {
+  if (fight.fighter_a_corner === corner) return 'a';
+  if (fight.fighter_b_corner === corner) return 'b';
+  return null;
+}
+
+/**
+ * The immutable a/b payload scores for a winner and the loser's points: the
+ * winner always takes 10, the loser takes their margin. This is the one place
+ * the winner-to-column mapping lives.
+ */
+export function payloadForWinner(
+  winner: 'a' | 'b',
+  loserPoints: number,
+): { fighter_a_score: number; fighter_b_score: number } {
+  return winner === 'a'
+    ? { fighter_a_score: 10, fighter_b_score: loserPoints }
+    : { fighter_a_score: loserPoints, fighter_b_score: 10 };
+}

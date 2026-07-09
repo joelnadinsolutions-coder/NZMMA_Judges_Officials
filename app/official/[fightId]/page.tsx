@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 
 type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
@@ -52,6 +53,20 @@ interface Submission {
   full: string;
   score: ScoreRow | null;
 }
+interface FinishFlagRow {
+  judge_id: string;
+  round_number: number;
+  method: 'ko' | 'tko' | 'submission' | 'dq' | 'other';
+  note: string | null;
+}
+
+const FLAG_METHOD_LABEL: Record<FinishFlagRow['method'], string> = {
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  other: 'Other',
+};
 
 // "Jay Nadin" -> "Jay N"; falls back to the local part of an email.
 function abbrev(name: string): string {
@@ -117,11 +132,13 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const [rounds, setRounds] = useState<Round[]>([]);
   const [judges, setJudges] = useState<Judge[]>([]);
   const [scores, setScores] = useState<ScoreRow[]>([]);
+  const [finishFlags, setFinishFlags] = useState<FinishFlagRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const load = useCallback(async () => {
-    // RLS returns these only to officials/admins.
+  // Each table has its own loader so a realtime change refetches only the slice
+  // that moved, not the whole page. RLS returns these only to officials/admins.
+  const loadFight = useCallback(async () => {
     const { data: f, error: fErr } = await supabase
       .from('fights')
       .select(
@@ -134,15 +151,18 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       return;
     }
     setFight(f as Fight);
+  }, [supabase, fightId]);
 
-    const { data: r } = await supabase
+  const loadRounds = useCallback(async () => {
+    const { data } = await supabase
       .from('rounds')
       .select('round_number, state, fighter_a_deduction, fighter_b_deduction, deduction_note')
       .eq('fight_id', fightId)
       .order('round_number');
-    setRounds((r ?? []) as Round[]);
+    setRounds((data ?? []) as Round[]);
+  }, [supabase, fightId]);
 
-    // Assigned judges (names) and every judge's submitted cards.
+  const loadJudges = useCallback(async () => {
     const { data: fj } = await supabase
       .from('fight_judges')
       .select('judge_id, seat')
@@ -151,47 +171,65 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const ids = (fj ?? []).map((row) => row.judge_id as string);
     const names: Record<string, string> = {};
     if (ids.length) {
-      const { data: profs } = await supabase
-        .from('profiles')
-        .select('id, full_name')
-        .in('id', ids);
+      const { data: profs } = await supabase.from('profiles').select('id, full_name').in('id', ids);
       profs?.forEach((p) => {
         names[p.id] = p.full_name;
       });
     }
     setJudges(ids.map((id) => ({ id, name: names[id] ?? id.slice(0, 8) })));
+  }, [supabase, fightId]);
 
-    const { data: sc } = await supabase
+  const loadScores = useCallback(async () => {
+    const { data } = await supabase
       .from('scores')
       .select('round_number, judge_id, fighter_a_score, fighter_b_score, note, margin_tag')
       .eq('fight_id', fightId);
-    setScores((sc ?? []) as ScoreRow[]);
+    setScores((data ?? []) as ScoreRow[]);
   }, [supabase, fightId]);
 
+  const loadFlags = useCallback(async () => {
+    const { data } = await supabase
+      .from('judge_finish_flags')
+      .select('judge_id, round_number, method, note')
+      .eq('fight_id', fightId);
+    setFinishFlags((data ?? []) as FinishFlagRow[]);
+  }, [supabase, fightId]);
+
+  // Refresh everything at once (initial mount and after the official's own
+  // mutations), running the slice loaders in parallel.
+  const reloadAll = useCallback(async () => {
+    await Promise.all([loadFight(), loadRounds(), loadJudges(), loadScores(), loadFlags()]);
+  }, [loadFight, loadRounds, loadJudges, loadScores, loadFlags]);
+
   useEffect(() => {
-    load();
+    reloadAll();
     const channel = supabase
       .channel(`official-${fightId}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rounds', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadRounds(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'fights', filter: `id=eq.${fightId}` },
-        () => load(),
+        () => loadFight(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'scores', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadScores(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'judge_finish_flags', filter: `fight_id=eq.${fightId}` },
+        () => loadFlags(),
       )
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, fightId, load]);
+  }, [supabase, fightId, reloadAll, loadRounds, loadFight, loadScores, loadFlags]);
 
   async function openRound(n: number) {
     if (busy) return;
@@ -202,7 +240,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const patch: Partial<Fight> = { current_round: n };
     if (fight?.state === 'scheduled') patch.state = 'in_progress';
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -217,7 +255,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       note: note || null,
     });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -228,7 +266,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ state: 'cancelled', result_note: note || null })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -238,7 +276,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     // lock_round() also locks every judge's card for the round.
     const { error: rpcErr } = await supabase.rpc('lock_round', { f_id: fightId, r_num: n });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -250,7 +288,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .update({ fighter_a_deduction: a, fighter_b_deduction: b, deduction_note: note || null })
       .eq('fight_id', fightId)
       .eq('round_number', n);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -258,7 +296,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     if (busy) return;
     setBusy(true);
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -269,7 +307,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ scheduled_rounds, round_minutes, is_championship })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -314,9 +352,14 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
       <header>
         <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            NZMMAF · Official control
-          </p>
+          <div className="flex items-center gap-2">
+            <Link href="/admin/events" className="text-lg leading-none text-slate-500">
+              ‹
+            </Link>
+            <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+              NZMMAF · Official control
+            </p>
+          </div>
           <FightStateBadge state={fight.state} />
         </div>
         <h1 className="mt-1 text-2xl font-black">
@@ -341,6 +384,29 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         <section className="rounded-2xl bg-red-500/10 p-4 text-center ring-1 ring-red-500/30">
           <p className="text-lg font-black text-red-300">Bout cancelled</p>
           {fight.result_note && <p className="mt-1 text-sm text-red-200/80">{fight.result_note}</p>}
+        </section>
+      )}
+
+      {/* Judges' finish observations: informational, the official's closure
+          below is the authoritative result. */}
+      {finishFlags.length > 0 && fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <section className="space-y-1 rounded-2xl bg-amber-500/10 p-3 ring-1 ring-amber-500/30">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-amber-300">
+            Judges flagged a finish
+          </p>
+          {finishFlags.map((fl) => {
+            const j = judges.find((x) => x.id === fl.judge_id);
+            return (
+              <p key={fl.judge_id} className="text-sm text-amber-200">
+                <span className="font-bold">{abbrev(j?.name ?? 'Judge')}</span>:{' '}
+                {FLAG_METHOD_LABEL[fl.method]} in R{fl.round_number}
+                {fl.note ? ` (${fl.note})` : ''}
+              </p>
+            );
+          })}
+          <p className="text-[11px] text-amber-200/70">
+            Close the bout below to record the official result.
+          </p>
         </section>
       )}
 
