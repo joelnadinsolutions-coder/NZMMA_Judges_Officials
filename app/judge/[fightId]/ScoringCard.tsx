@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import { enqueueScore, pendingCount, registerAutoFlush } from '@/lib/offlineQueue';
-import { A_WINS, B_WINS, EVEN, type MarginTag, type ScoreOption } from '@/lib/scoring';
+import { A_WINS, B_WINS, EVEN, winnerOptions, type MarginTag, type ScoreOption } from '@/lib/scoring';
 
 interface Fight {
   id: string;
@@ -236,9 +236,6 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       setBlockedTarget(null);
     }
   }, [blockedTarget, hasUnconfirmedPick]);
-
-  const cornerClass = (corner: string) =>
-    corner === 'red' ? 'ring-red-500/70' : corner === 'blue' ? 'ring-sky-500/70' : 'ring-slate-500/70';
 
   const roundState: RoundState = roundStates[round] ?? 'pending';
   const roundLive = roundState === 'live';
@@ -526,10 +523,8 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
       {/* ---- Fighter columns ---- */}
       <main className="flex flex-1 flex-col gap-4 px-4">
         <FighterColumn
-          name={fight.fighter_a_name}
-          corner={fight.fighter_a_corner}
-          ringClass={cornerClass(fight.fighter_a_corner)}
-          options={A_WINS}
+          fight={fight}
+          fighter="a"
           selected={selected}
           onPick={setSelected}
           disabled={pickDisabled}
@@ -548,10 +543,8 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         </button>
 
         <FighterColumn
-          name={fight.fighter_b_name}
-          corner={fight.fighter_b_corner}
-          ringClass={cornerClass(fight.fighter_b_corner)}
-          options={B_WINS}
+          fight={fight}
+          fighter="b"
           selected={selected}
           onPick={setSelected}
           disabled={pickDisabled}
@@ -632,23 +625,31 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
   );
 }
 
+// One source of truth per column: pass only the fighter key and the fight.
+// Name, corner label, ring colour and winner buttons all derive from the same
+// fighter, so a red-corner win can never be recorded against the blue fighter.
 function FighterColumn({
-  name,
-  corner,
-  ringClass,
-  options,
+  fight,
+  fighter,
   selected,
   onPick,
   disabled,
 }: {
-  name: string;
-  corner: string;
-  ringClass: string;
-  options: ScoreOption[];
+  fight: Fight;
+  fighter: 'a' | 'b';
   selected: ScoreOption | null;
   onPick: (o: ScoreOption) => void;
   disabled: boolean;
 }) {
+  const name = fighter === 'a' ? fight.fighter_a_name : fight.fighter_b_name;
+  const corner = fighter === 'a' ? fight.fighter_a_corner : fight.fighter_b_corner;
+  const options = winnerOptions(fighter);
+  const ringClass =
+    corner === 'red'
+      ? 'ring-red-500/70'
+      : corner === 'blue'
+      ? 'ring-sky-500/70'
+      : 'ring-slate-500/70';
   return (
     <section className={`rounded-2xl bg-slate-900 p-3 ring-2 ${ringClass}`}>
       <div className="mb-2 flex items-center justify-between">
