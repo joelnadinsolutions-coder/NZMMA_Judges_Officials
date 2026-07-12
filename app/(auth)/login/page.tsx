@@ -14,6 +14,10 @@ interface AssignedBout {
   state: string;
 }
 
+// Short build marker so you can tell at a glance which build a device is
+// running (Vercel injects the commit SHA; 'local' in dev). Bumped every deploy.
+const BUILD_ID = (process.env.NEXT_PUBLIC_VERCEL_GIT_COMMIT_SHA ?? 'local').slice(0, 7);
+
 export default function LoginPage() {
   const supabase = getSupabase();
   const [mode, setMode] = useState<Mode>('signin');
@@ -393,6 +397,8 @@ export default function LoginPage() {
             </div>
           </>
         )}
+
+        <p className="pt-2 text-[10px] font-mono text-slate-700">build {BUILD_ID}</p>
       </div>
     </div>
   );
