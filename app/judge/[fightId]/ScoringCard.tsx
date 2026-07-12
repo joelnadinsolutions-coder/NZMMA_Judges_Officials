@@ -10,6 +10,7 @@ import {
   EVEN,
   cornerToSide,
   roundDeductionTotals,
+  scoreFromCornerPick,
   type Corner,
   type Deduction,
   type RoundNote,
@@ -336,11 +337,8 @@ export default function ScoringCard({ fight }: { fight: Fight }) {
         return;
       }
       setConfirmingEven(false);
-      const red = tenSide === 'red' ? 10 : v;
-      const blue = tenSide === 'blue' ? 10 : v;
-      const a = redIsA ? red : blue;
-      const b = redIsA ? blue : red;
-      setSelected(optionFor(a, b));
+      const { fighter_a_score, fighter_b_score } = scoreFromCornerPick(tenSide, v, redIsA);
+      setSelected(optionFor(fighter_a_score, fighter_b_score));
     },
     [pickDisabled, tenSide, redIsA],
   );

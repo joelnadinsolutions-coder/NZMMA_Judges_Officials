@@ -107,3 +107,24 @@ export const B_WINS: ScoreOption[] = [
 ];
 
 export const EVEN: ScoreOption = { label: '10-10', a: 10, b: 10, winner: 'even' };
+
+/**
+ * The two-step picker's output as an immutable a/b payload.
+ *
+ * Given which corner takes the 10, the loser corner's points, and which
+ * fighter is the red corner (`redIsA`), return each fighter's own score. This
+ * is the single source of truth for the corner-to-fighter mapping when
+ * scoring, so a red-corner win can never be recorded against the blue fighter.
+ * The scoring card calls this directly; the unit tests lock its behaviour.
+ */
+export function scoreFromCornerPick(
+  tenSide: Corner,
+  otherPoints: number,
+  redIsA: boolean,
+): { fighter_a_score: number; fighter_b_score: number } {
+  const red = tenSide === 'red' ? 10 : otherPoints;
+  const blue = tenSide === 'blue' ? 10 : otherPoints;
+  return redIsA
+    ? { fighter_a_score: red, fighter_b_score: blue }
+    : { fighter_a_score: blue, fighter_b_score: red };
+}
