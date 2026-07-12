@@ -1,7 +1,9 @@
 'use client';
 
 import { use, useCallback, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
+import { cornerToSide, roundDeductionTotals, type Corner, type Deduction } from '@/lib/scoring';
 
 type FightState = 'scheduled' | 'in_progress' | 'completed' | 'cancelled';
 type ResultMethod = 'decision' | 'ko' | 'tko' | 'submission' | 'dq' | 'no_contest';
@@ -29,10 +31,13 @@ type RoundState = 'pending' | 'live' | 'locked';
 interface Round {
   round_number: number;
   state: RoundState;
-  fighter_a_deduction: number;
-  fighter_b_deduction: number;
-  deduction_note: string | null;
 }
+
+const DEDUCTION_STATUS_LABEL: Record<Deduction['status'], string> = {
+  pending: 'pending confirmation',
+  confirmed: 'confirmed',
+  voided: 'voided',
+};
 
 interface Judge {
   id: string;
@@ -44,7 +49,7 @@ interface ScoreRow {
   fighter_a_score: number;
   fighter_b_score: number;
   note: string | null;
-  margin_tag: 'close' | 'decisive' | null;
+  round_note: 'decisive' | 'moderate' | 'close' | null;
 }
 interface Submission {
   label: string; // J1 / J2 / J3
@@ -52,6 +57,20 @@ interface Submission {
   full: string;
   score: ScoreRow | null;
 }
+interface FinishFlagRow {
+  judge_id: string;
+  round_number: number;
+  method: 'ko' | 'tko' | 'submission' | 'dq' | 'other';
+  note: string | null;
+}
+
+const FLAG_METHOD_LABEL: Record<FinishFlagRow['method'], string> = {
+  ko: 'KO',
+  tko: 'TKO',
+  submission: 'Submission',
+  dq: 'DQ',
+  other: 'Other',
+};
 
 // "Jay Nadin" -> "Jay N"; falls back to the local part of an email.
 function abbrev(name: string): string {
@@ -117,11 +136,15 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const [rounds, setRounds] = useState<Round[]>([]);
   const [judges, setJudges] = useState<Judge[]>([]);
   const [scores, setScores] = useState<ScoreRow[]>([]);
+  const [deductions, setDeductions] = useState<Deduction[]>([]);
+  const [finishFlags, setFinishFlags] = useState<FinishFlagRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showSetup, setShowSetup] = useState(false);
 
-  const load = useCallback(async () => {
-    // RLS returns these only to officials/admins.
+  // Each table has its own loader so a realtime change refetches only the slice
+  // that moved, not the whole page. RLS returns these only to officials/admins.
+  const loadFight = useCallback(async () => {
     const { data: f, error: fErr } = await supabase
       .from('fights')
       .select(
@@ -134,15 +157,27 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       return;
     }
     setFight(f as Fight);
+  }, [supabase, fightId]);
 
-    const { data: r } = await supabase
+  const loadRounds = useCallback(async () => {
+    const { data } = await supabase
       .from('rounds')
-      .select('round_number, state, fighter_a_deduction, fighter_b_deduction, deduction_note')
+      .select('round_number, state')
       .eq('fight_id', fightId)
       .order('round_number');
-    setRounds((r ?? []) as Round[]);
+    setRounds((data ?? []) as Round[]);
+  }, [supabase, fightId]);
 
-    // Assigned judges (names) and every judge's submitted cards.
+  const loadDeductions = useCallback(async () => {
+    const { data } = await supabase
+      .from('deductions')
+      .select('*')
+      .eq('fight_id', fightId)
+      .order('round_number');
+    setDeductions((data ?? []) as Deduction[]);
+  }, [supabase, fightId]);
+
+  const loadJudges = useCallback(async () => {
     const { data: fj } = await supabase
       .from('fight_judges')
       .select('judge_id, seat')
@@ -151,47 +186,77 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const ids = (fj ?? []).map((row) => row.judge_id as string);
     const names: Record<string, string> = {};
     if (ids.length) {
-      const { data: profs } = await supabase
-        .from('profiles')
-        .select('id, full_name')
-        .in('id', ids);
+      const { data: profs } = await supabase.from('profiles').select('id, full_name').in('id', ids);
       profs?.forEach((p) => {
         names[p.id] = p.full_name;
       });
     }
     setJudges(ids.map((id) => ({ id, name: names[id] ?? id.slice(0, 8) })));
-
-    const { data: sc } = await supabase
-      .from('scores')
-      .select('round_number, judge_id, fighter_a_score, fighter_b_score, note, margin_tag')
-      .eq('fight_id', fightId);
-    setScores((sc ?? []) as ScoreRow[]);
   }, [supabase, fightId]);
 
+  const loadScores = useCallback(async () => {
+    const { data } = await supabase
+      .from('scores')
+      .select('round_number, judge_id, fighter_a_score, fighter_b_score, note, round_note')
+      .eq('fight_id', fightId);
+    setScores((data ?? []) as ScoreRow[]);
+  }, [supabase, fightId]);
+
+  const loadFlags = useCallback(async () => {
+    const { data } = await supabase
+      .from('judge_finish_flags')
+      .select('judge_id, round_number, method, note')
+      .eq('fight_id', fightId);
+    setFinishFlags((data ?? []) as FinishFlagRow[]);
+  }, [supabase, fightId]);
+
+  // Refresh everything at once (initial mount and after the official's own
+  // mutations), running the slice loaders in parallel.
+  const reloadAll = useCallback(async () => {
+    await Promise.all([
+      loadFight(),
+      loadRounds(),
+      loadJudges(),
+      loadScores(),
+      loadDeductions(),
+      loadFlags(),
+    ]);
+  }, [loadFight, loadRounds, loadJudges, loadScores, loadDeductions, loadFlags]);
+
   useEffect(() => {
-    load();
+    reloadAll();
     const channel = supabase
       .channel(`official-${fightId}`)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'rounds', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadRounds(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'fights', filter: `id=eq.${fightId}` },
-        () => load(),
+        () => loadFight(),
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'scores', filter: `fight_id=eq.${fightId}` },
-        () => load(),
+        () => loadScores(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'deductions', filter: `fight_id=eq.${fightId}` },
+        () => loadDeductions(),
+      )
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'judge_finish_flags', filter: `fight_id=eq.${fightId}` },
+        () => loadFlags(),
       )
       .subscribe();
     return () => {
       supabase.removeChannel(channel);
     };
-  }, [supabase, fightId, load]);
+  }, [supabase, fightId, reloadAll, loadRounds, loadFight, loadScores, loadDeductions, loadFlags]);
 
   async function openRound(n: number) {
     if (busy) return;
@@ -202,7 +267,32 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     const patch: Partial<Fight> = { current_round: n };
     if (fight?.state === 'scheduled') patch.state = 'in_progress';
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
+    setBusy(false);
+  }
+
+  // Liven the whole bout at once: every round that is not already locked goes
+  // live, so the assigned judges score straight through (in order) without the
+  // official opening each round one at a time.
+  async function startBout() {
+    if (busy) return;
+    setBusy(true);
+    await supabase
+      .from('rounds')
+      .update({ state: 'live', started_at: new Date().toISOString() })
+      .eq('fight_id', fightId)
+      .neq('state', 'locked');
+    // Only reset the follow-round when kicking off a scheduled bout, so
+    // re-livening mid-bout does not yank judges back to round 1.
+    const patch: Partial<Fight> = {};
+    if (fight?.state === 'scheduled') {
+      patch.state = 'in_progress';
+      patch.current_round = 1;
+    }
+    if (Object.keys(patch).length > 0) {
+      await supabase.from('fights').update(patch).eq('id', fightId);
+    }
+    await reloadAll();
     setBusy(false);
   }
 
@@ -217,7 +307,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       note: note || null,
     });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -228,7 +318,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ state: 'cancelled', result_note: note || null })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -238,19 +328,41 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     // lock_round() also locks every judge's card for the round.
     const { error: rpcErr } = await supabase.rpc('lock_round', { f_id: fightId, r_num: n });
     if (rpcErr) setError(rpcErr.message);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
-  async function saveDeduction(n: number, a: number, b: number, note: string) {
+  async function setDeductionStatus(id: string, status: 'confirmed' | 'voided') {
     if (busy) return;
     setBusy(true);
-    await supabase
-      .from('rounds')
-      .update({ fighter_a_deduction: a, fighter_b_deduction: b, deduction_note: note || null })
-      .eq('fight_id', fightId)
-      .eq('round_number', n);
-    await load();
+    const { error: rpcErr } = await supabase.rpc('set_deduction_status', {
+      d_id: id,
+      new_status: status,
+    });
+    if (rpcErr) setError(rpcErr.message);
+    await loadDeductions();
+    setBusy(false);
+  }
+
+  async function addDeduction(roundNumber: number, corner: Corner, points: number, reason: string) {
+    if (busy) return;
+    setBusy(true);
+    const { data: u } = await supabase.auth.getUser();
+    const uid = u.user?.id;
+    if (!uid) {
+      setBusy(false);
+      return;
+    }
+    const { error: insErr } = await supabase.from('deductions').insert({
+      fight_id: fightId,
+      round_number: roundNumber,
+      corner,
+      points,
+      reason: reason.trim() || null,
+      entered_by: uid,
+    });
+    if (insErr) setError(insErr.message);
+    await loadDeductions();
     setBusy(false);
   }
 
@@ -258,7 +370,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     if (busy) return;
     setBusy(true);
     await supabase.from('fights').update(patch).eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -269,7 +381,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
       .from('fights')
       .update({ scheduled_rounds, round_minutes, is_championship })
       .eq('id', fightId);
-    await load();
+    await reloadAll();
     setBusy(false);
   }
 
@@ -293,13 +405,21 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
     for (const r of rounds) {
       const s = scores.find((x) => x.judge_id === j.id && x.round_number === r.round_number);
       if (!s) continue;
-      a += s.fighter_a_score - r.fighter_a_deduction;
-      b += s.fighter_b_score - r.fighter_b_deduction;
+      const d = roundDeductionTotals(deductions, r.round_number, fight);
+      a += s.fighter_a_score - d.a;
+      b += s.fighter_b_score - d.b;
     }
     return { id: j.id, label: `J${i + 1}`, short: abbrev(j.name), a, b };
   });
+
+  const pendingDeductions = deductions.filter((d) => d.status === 'pending');
   const shortA = fight.fighter_a_name.split(' ')[0];
   const shortB = fight.fighter_b_name.split(' ')[0];
+
+  // Corner-keyed names for the Red/Blue scorecard headings.
+  const redIsA = fight.fighter_a_corner === 'red';
+  const redName = redIsA ? fight.fighter_a_name : fight.fighter_b_name;
+  const blueName = redIsA ? fight.fighter_b_name : fight.fighter_a_name;
 
   // Each judge's pick, then the combined decision.
   const results: JudgeResult[] = totals.map((t) => (t.a > t.b ? 'a' : t.b > t.a ? 'b' : 'draw'));
@@ -311,16 +431,28 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
   const suggestedWinner = majorityWinner(results);
 
   return (
-    <div className="mx-auto min-h-dvh max-w-md space-y-4 bg-slate-950 px-4 py-6 text-slate-50">
+    <div className="mx-auto min-h-dvh max-w-md space-y-3 bg-slate-950 px-4 py-5 text-slate-50">
       <header>
         <div className="flex items-center justify-between">
-          <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
-            NZMMAF · Official control
-          </p>
+          <div className="flex items-center gap-2">
+            <Link href="/admin/events" className="text-lg leading-none text-slate-500">
+              ‹
+            </Link>
+            <p className="text-xs font-semibold uppercase tracking-widest text-slate-400">
+              NZMMAF · Official control
+            </p>
+          </div>
           <FightStateBadge state={fight.state} />
         </div>
-        <h1 className="mt-1 text-2xl font-black">
-          {fight.fighter_a_name} <span className="text-slate-500">vs</span> {fight.fighter_b_name}
+        <h1 className="mt-1 space-y-0.5 text-lg font-black leading-tight">
+          <span className="block">
+            <span className="text-[11px] font-bold uppercase tracking-widest text-red-400">Red</span>{' '}
+            {redName}
+          </span>
+          <span className="block">
+            <span className="text-[11px] font-bold uppercase tracking-widest text-sky-400">Blue</span>{' '}
+            {blueName}
+          </span>
         </h1>
       </header>
 
@@ -344,6 +476,29 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         </section>
       )}
 
+      {/* Judges' finish observations: informational, the official's closure
+          below is the authoritative result. */}
+      {finishFlags.length > 0 && fight.state !== 'completed' && fight.state !== 'cancelled' && (
+        <section className="space-y-1 rounded-2xl bg-amber-500/10 p-3 ring-1 ring-amber-500/30">
+          <p className="text-[10px] font-bold uppercase tracking-widest text-amber-300">
+            Judges flagged a finish
+          </p>
+          {finishFlags.map((fl) => {
+            const j = judges.find((x) => x.id === fl.judge_id);
+            return (
+              <p key={fl.judge_id} className="text-sm text-amber-200">
+                <span className="font-bold">{abbrev(j?.name ?? 'Judge')}</span>:{' '}
+                {FLAG_METHOD_LABEL[fl.method]} in R{fl.round_number}
+                {fl.note ? ` (${fl.note})` : ''}
+              </p>
+            );
+          })}
+          <p className="text-[11px] text-amber-200/70">
+            Close the bout below to record the official result.
+          </p>
+        </section>
+      )}
+
       {judges.length > 0 && (
         <section className="rounded-2xl bg-slate-900 p-3">
           <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">
@@ -360,23 +515,51 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         </section>
       )}
 
-      <BoutDetailsEditor fight={fight} onSave={saveDetails} busy={busy} />
-
-      <FormatEditor fight={fight} onSave={saveFormat} busy={busy} />
+      <div className="space-y-3">
+        <button
+          onClick={() => setShowSetup((s) => !s)}
+          className="w-full rounded-xl bg-slate-900 px-4 py-2 text-left text-xs font-bold uppercase tracking-widest text-slate-400"
+        >
+          {showSetup ? '▾' : '▸'} Setup (names, corners, format)
+        </button>
+        {showSetup && (
+          <>
+            <BoutDetailsEditor fight={fight} onSave={saveDetails} busy={busy} />
+            <FormatEditor fight={fight} onSave={saveFormat} busy={busy} />
+          </>
+        )}
+      </div>
 
       <section className="space-y-3">
-        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Rounds</h2>
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Rounds</h2>
+          {fight.state !== 'completed' &&
+            fight.state !== 'cancelled' &&
+            rounds.some((r) => r.state === 'pending') && (
+              <button
+                onClick={startBout}
+                disabled={busy}
+                className="rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white disabled:opacity-40"
+              >
+                Start bout · all rounds live
+              </button>
+            )}
+        </div>
         {rounds.map((r) => (
           <RoundControl
             key={r.round_number}
             round={r}
-            fighterA={fight.fighter_a_name}
-            fighterB={fight.fighter_b_name}
+            fight={fight}
             isCurrent={r.round_number === fight.current_round}
             busy={busy}
+            deductions={deductions.filter((d) => d.round_number === r.round_number)}
             onOpen={() => openRound(r.round_number)}
             onLock={() => lockRound(r.round_number)}
-            onSaveDeduction={(a, b, note) => saveDeduction(r.round_number, a, b, note)}
+            onConfirmDeduction={(id) => setDeductionStatus(id, 'confirmed')}
+            onVoidDeduction={(id) => setDeductionStatus(id, 'voided')}
+            onAddDeduction={(corner, points, reason) =>
+              addDeduction(r.round_number, corner, points, reason)
+            }
             submissions={judges.map((j, i) => ({
               label: `J${i + 1}`,
               short: abbrev(j.name),
@@ -390,13 +573,11 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
 
       {/* ---- Totals ---- */}
       <section className="space-y-2 rounded-2xl bg-slate-900 p-4">
-        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">
-          Result ({shortA} — {shortB})
-        </h2>
+        <h2 className="text-sm font-bold uppercase tracking-widest text-slate-400">Result</h2>
 
         {totals.length > 0 && (
           <div className="rounded-xl bg-slate-950/60 p-3 text-center">
-            <p className="text-xl font-black">{decision}</p>
+            <p className="text-lg font-black">{decision}</p>
             {decisionNotes.length > 0 && (
               <p className="mt-0.5 text-[11px] uppercase tracking-wide text-slate-500">
                 {decisionNotes.join(' · ')}
@@ -406,20 +587,37 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
         )}
 
         {totals.length === 0 && <p className="text-sm text-slate-500">No judges assigned yet.</p>}
-        {totals.map((t) => {
-          const lead = t.a > t.b ? shortA : t.b > t.a ? shortB : 'even';
-          return (
-            <div key={t.id} className="flex items-center justify-between text-sm">
-              <span className="text-slate-300">
-                <span className="font-black text-slate-500">{t.label}</span> {t.short}
-              </span>
-              <span className="font-bold tabular-nums">
-                {t.a} — {t.b}
-                <span className="ml-2 text-xs font-semibold uppercase text-emerald-300">{lead}</span>
-              </span>
-            </div>
-          );
-        })}
+        {totals.length > 0 && (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-[10px] font-bold uppercase tracking-wider text-slate-500">
+                <th className="py-1 text-left">Judge</th>
+                <th className="py-1 text-right text-red-400">{redName.split(' ')[0]}</th>
+                <th className="py-1 text-right text-sky-400">{blueName.split(' ')[0]}</th>
+                <th className="py-1 text-right">Lead</th>
+              </tr>
+            </thead>
+            <tbody>
+              {totals.map((t) => {
+                const red = redIsA ? t.a : t.b;
+                const blue = redIsA ? t.b : t.a;
+                const lead = red > blue ? 'Red' : blue > red ? 'Blue' : '=';
+                return (
+                  <tr key={t.id} className="border-t border-slate-800">
+                    <td className="py-1.5 text-left text-slate-300">
+                      <span className="font-black text-slate-500">{t.label}</span> {t.short}
+                    </td>
+                    <td className="py-1.5 text-right font-bold tabular-nums">{red}</td>
+                    <td className="py-1.5 text-right font-bold tabular-nums">{blue}</td>
+                    <td className="py-1.5 text-right text-xs font-semibold uppercase text-emerald-300">
+                      {lead}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </section>
 
       {fight.state !== 'completed' && fight.state !== 'cancelled' && (
@@ -429,6 +627,7 @@ export default function OfficialFightPage({ params }: { params: Promise<{ fightI
           scheduledRounds={fight.scheduled_rounds}
           suggestedWinner={suggestedWinner}
           busy={busy}
+          pendingDeductions={pendingDeductions.length}
           onClose={closeBout}
           onCancel={cancelBout}
         />
@@ -463,6 +662,7 @@ function CloseBout({
   scheduledRounds,
   suggestedWinner,
   busy,
+  pendingDeductions,
   onClose,
   onCancel,
 }: {
@@ -471,6 +671,7 @@ function CloseBout({
   scheduledRounds: number;
   suggestedWinner: ResultWinner;
   busy: boolean;
+  pendingDeductions: number;
   onClose: (method: ResultMethod, winner: ResultWinner | null, atRound: number | null, note: string) => void;
   onCancel: (note: string) => void;
 }) {
@@ -580,13 +781,22 @@ function CloseBout({
           </div>
         </div>
       ) : (
-        <button
-          onClick={() => setConfirming(true)}
-          disabled={busy}
-          className="h-12 w-full rounded-xl bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
-        >
-          Close bout
-        </button>
+        <>
+          {pendingDeductions > 0 && (
+            <p className="rounded-xl bg-amber-500/10 px-3 py-2 text-center text-xs font-semibold text-amber-300 ring-1 ring-amber-500/30">
+              {pendingDeductions} deduction{pendingDeductions > 1 ? 's' : ''} awaiting confirmation.
+              Confirm or void {pendingDeductions > 1 ? 'them' : 'it'} above before finalising the
+              result.
+            </p>
+          )}
+          <button
+            onClick={() => setConfirming(true)}
+            disabled={busy || pendingDeductions > 0}
+            className="h-12 w-full rounded-xl bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
+          >
+            Close bout
+          </button>
+        </>
       )}
 
       {cancelling ? (
@@ -796,30 +1006,42 @@ function Segmented({
 
 function RoundControl({
   round,
-  fighterA,
-  fighterB,
+  fight,
   isCurrent,
   busy,
+  deductions,
   onOpen,
   onLock,
-  onSaveDeduction,
+  onConfirmDeduction,
+  onVoidDeduction,
+  onAddDeduction,
   submissions,
 }: {
   round: Round;
-  fighterA: string;
-  fighterB: string;
+  fight: Fight;
   isCurrent: boolean;
   busy: boolean;
+  deductions: Deduction[];
   onOpen: () => void;
   onLock: () => void;
-  onSaveDeduction: (a: number, b: number, note: string) => void;
+  onConfirmDeduction: (id: string) => void;
+  onVoidDeduction: (id: string) => void;
+  onAddDeduction: (corner: Corner, points: number, reason: string) => void;
   submissions: Submission[];
 }) {
-  const [a, setA] = useState(round.fighter_a_deduction);
-  const [b, setB] = useState(round.fighter_b_deduction);
-  const [note, setNote] = useState(round.deduction_note ?? '');
-  const dedDirty =
-    a !== round.fighter_a_deduction || b !== round.fighter_b_deduction || (note ?? '') !== (round.deduction_note ?? '');
+  const fighterA = fight.fighter_a_name;
+  const fighterB = fight.fighter_b_name;
+  const [adding, setAdding] = useState(false);
+  const [corner, setCorner] = useState<Corner>(
+    fight.fighter_a_corner === 'blue' && fight.fighter_b_corner === 'red' ? 'blue' : 'red',
+  );
+  const [points, setPoints] = useState(1);
+  const [reason, setReason] = useState('');
+
+  const nameForCorner = (c: Corner) => {
+    const side = cornerToSide(fight, c);
+    return (side === 'a' ? fighterA : side === 'b' ? fighterB : c).split(' ')[0];
+  };
 
   const badge =
     round.state === 'live'
@@ -853,9 +1075,9 @@ function RoundControl({
                 <span className="font-bold tabular-nums">
                   {sub.score ? `${sub.score.fighter_a_score}-${sub.score.fighter_b_score}` : '—'}
                 </span>
-                {sub.score?.margin_tag && (
+                {sub.score?.round_note && (
                   <span className="text-[9px] font-bold uppercase text-amber-300">
-                    {sub.score.margin_tag[0]}
+                    {sub.score.round_note[0]}
                   </span>
                 )}
                 {sub.score?.note && <span className="text-[10px] text-slate-500">✎</span>}
@@ -871,7 +1093,7 @@ function RoundControl({
                     <p className="mt-0.5 text-slate-300">
                       {fighterA.split(' ')[0]} {sub.score.fighter_a_score} — {sub.score.fighter_b_score}{' '}
                       {fighterB.split(' ')[0]}
-                      {sub.score.margin_tag ? ` (${sub.score.margin_tag})` : ''}
+                      {sub.score.round_note ? ` (${sub.score.round_note})` : ''}
                     </p>
                     {sub.score.note && (
                       <p className="mt-1 italic text-slate-400">“{sub.score.note}”</p>
@@ -884,13 +1106,6 @@ function RoundControl({
             </div>
           ))}
         </div>
-        {(round.fighter_a_deduction > 0 || round.fighter_b_deduction > 0) && (
-          <p className="pt-2 text-[11px] font-semibold text-red-300">
-            Deductions: {fighterA.split(' ')[0]} -{round.fighter_a_deduction}, {fighterB.split(' ')[0]}{' '}
-            -{round.fighter_b_deduction}
-            {round.deduction_note ? ` (${round.deduction_note})` : ''}
-          </p>
-        )}
       </div>
 
       <div className="mb-3 flex gap-2">
@@ -910,49 +1125,124 @@ function RoundControl({
         </button>
       </div>
 
+      {/* ---- Deductions: list with confirm / void, plus an official add ---- */}
       <p className="mb-1 text-[10px] font-bold uppercase tracking-widest text-slate-500">
         Point deductions
       </p>
-      <div className="flex gap-2">
-        <Stepper label={fighterA} value={a} onChange={setA} />
-        <Stepper label={fighterB} value={b} onChange={setB} />
-      </div>
-      <input
-        value={note}
-        onChange={(e) => setNote(e.target.value)}
-        placeholder="Reason (e.g. low blow)"
-        className="mt-2 h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
-      />
-      <button
-        onClick={() => onSaveDeduction(a, b, note)}
-        disabled={!dedDirty || busy}
-        className="mt-2 h-10 w-full rounded-lg bg-slate-50 text-sm font-bold text-slate-950 disabled:opacity-40"
-      >
-        Save deductions
-      </button>
-    </div>
-  );
-}
+      {deductions.length === 0 ? (
+        <p className="text-xs text-slate-500">None this round.</p>
+      ) : (
+        <div className="space-y-1.5">
+          {deductions.map((d) => (
+            <div
+              key={d.id}
+              className="flex items-center justify-between gap-2 rounded-lg bg-slate-800/60 px-2.5 py-1.5"
+            >
+              <span
+                className={`text-xs ${
+                  d.status === 'voided' ? 'text-slate-600 line-through' : 'text-slate-100'
+                }`}
+              >
+                <span className="font-bold text-red-300">
+                  -{d.points} {d.corner.toUpperCase()}
+                </span>{' '}
+                ({nameForCorner(d.corner)})
+                {d.reason ? ` · ${d.reason}` : ''}{' '}
+                <span className="text-slate-500">({DEDUCTION_STATUS_LABEL[d.status]})</span>
+              </span>
+              {d.status === 'pending' && (
+                <span className="flex shrink-0 gap-1">
+                  <button
+                    onClick={() => onConfirmDeduction(d.id)}
+                    disabled={busy}
+                    className="rounded-md bg-emerald-500 px-2 py-1 text-[11px] font-bold text-white disabled:opacity-40"
+                  >
+                    Confirm
+                  </button>
+                  <button
+                    onClick={() => onVoidDeduction(d.id)}
+                    disabled={busy}
+                    className="rounded-md bg-red-600/80 px-2 py-1 text-[11px] font-bold text-white disabled:opacity-40"
+                  >
+                    Void
+                  </button>
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
-function Stepper({ label, value, onChange }: { label: string; value: number; onChange: (v: number) => void }) {
-  return (
-    <div className="flex-1 rounded-xl bg-slate-800 p-2 text-center">
-      <p className="mb-1 truncate text-[11px] font-semibold text-slate-300">{label}</p>
-      <div className="flex items-center justify-between">
+      {adding ? (
+        <div className="mt-2 space-y-2 rounded-xl bg-slate-950/60 p-3">
+          <div className="flex gap-2">
+            {(['red', 'blue'] as Corner[]).map((c) => (
+              <button
+                key={c}
+                onClick={() => setCorner(c)}
+                className={`h-10 flex-1 rounded-lg text-xs font-bold uppercase transition ${
+                  corner === c
+                    ? c === 'red'
+                      ? 'bg-red-500 text-white'
+                      : 'bg-sky-500 text-white'
+                    : 'bg-slate-800 text-slate-300'
+                }`}
+              >
+                {c} · {nameForCorner(c)}
+              </button>
+            ))}
+          </div>
+          <div className="flex items-center justify-between rounded-lg bg-slate-800 p-1.5">
+            <button
+              onClick={() => setPoints((p) => Math.max(1, p - 1))}
+              className="h-9 w-9 rounded-lg bg-slate-700 text-lg font-black"
+            >
+              −
+            </button>
+            <span className="text-lg font-black tabular-nums">-{points}</span>
+            <button
+              onClick={() => setPoints((p) => Math.min(3, p + 1))}
+              className="h-9 w-9 rounded-lg bg-slate-700 text-lg font-black"
+            >
+              +
+            </button>
+          </div>
+          <input
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            placeholder="Reason (e.g. low blow)"
+            className="h-10 w-full rounded-lg bg-slate-800 px-3 text-sm text-slate-100 placeholder:text-slate-600"
+          />
+          <div className="flex gap-2">
+            <button
+              onClick={() => {
+                onAddDeduction(corner, points, reason);
+                setReason('');
+                setPoints(1);
+                setAdding(false);
+              }}
+              disabled={busy}
+              className="h-10 flex-1 rounded-lg bg-red-500 text-sm font-bold text-white disabled:opacity-40"
+            >
+              Add -{points} {corner.toUpperCase()}
+            </button>
+            <button
+              onClick={() => setAdding(false)}
+              className="h-10 rounded-lg bg-slate-800 px-4 text-sm font-bold text-slate-300"
+            >
+              Back
+            </button>
+          </div>
+        </div>
+      ) : (
         <button
-          onClick={() => onChange(Math.max(0, value - 1))}
-          className="h-9 w-9 rounded-lg bg-slate-700 text-lg font-black text-slate-100"
+          onClick={() => setAdding(true)}
+          disabled={busy}
+          className="mt-2 h-10 w-full rounded-lg bg-slate-800 text-sm font-bold text-red-300 ring-1 ring-red-500/30 disabled:opacity-40"
         >
-          −
+          Add deduction
         </button>
-        <span className="text-xl font-black tabular-nums">-{value}</span>
-        <button
-          onClick={() => onChange(Math.min(3, value + 1))}
-          className="h-9 w-9 rounded-lg bg-slate-700 text-lg font-black text-slate-100"
-        >
-          +
-        </button>
-      </div>
+      )}
     </div>
   );
 }

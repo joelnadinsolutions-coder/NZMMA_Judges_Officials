@@ -67,6 +67,18 @@ export default function AdminHub() {
         </span>
         <span className="text-slate-500">{events}</span>
       </Link>
+
+      {/* Officials often also sit as judges on the night. */}
+      <Link
+        href="/login"
+        className="flex items-center justify-between rounded-2xl bg-slate-900 p-5"
+      >
+        <span>
+          <span className="block text-lg font-bold">My judging</span>
+          <span className="text-sm text-slate-400">Bouts you are assigned to score</span>
+        </span>
+        <span className="text-slate-600">›</span>
+      </Link>
     </div>
   );
 }

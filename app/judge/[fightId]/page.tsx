@@ -1,6 +1,7 @@
 'use client';
 
 import { use, useEffect, useState } from 'react';
+import Link from 'next/link';
 import { getSupabase } from '@/lib/supabase/client';
 import ScoringCard from './ScoringCard';
 
@@ -44,7 +45,15 @@ export default function JudgeFightPage({ params }: { params: Promise<{ fightId: 
   if (error) {
     return (
       <div className="grid min-h-dvh place-items-center bg-slate-950 px-6 text-center text-slate-300">
-        <p className="text-lg font-semibold">{error}</p>
+        <div className="w-full max-w-sm space-y-4">
+          <p className="text-lg font-semibold">{error}</p>
+          <Link
+            href="/login"
+            className="block h-12 rounded-xl bg-slate-50 text-sm font-bold leading-[3rem] text-slate-950"
+          >
+            Back to your bouts
+          </Link>
+        </div>
       </div>
     );
   }
